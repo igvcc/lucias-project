@@ -1078,13 +1078,24 @@ extern "system" fn xuser_add_by_id_with_ui_async(
 ) -> HRESULT {
     xuser_add_async(this, options, block)
 }
+static XUSER_CHANGE_CB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static XUSER_CHANGE_CTX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 extern "system" fn xuser_add_result(_: This, block: *mut XAsyncBlock, out: *mut *const c_void) -> HRESULT {
     boot_trace(
         "xgameruntime",
         "XUser::AddResult",
         &format!("block={block:?} user={:?}", (&raw const OFFLINE_USER_HANDLE)),
     );
-    put(out, (&raw const OFFLINE_USER_HANDLE).cast())
+    let hr = put(out, (&raw const OFFLINE_USER_HANDLE).cast());
+    let cb = XUSER_CHANGE_CB.load(Ordering::Acquire);
+    if hr >= 0 && cb != 0 {
+        let ctx = XUSER_CHANGE_CTX.load(Ordering::Acquire) as *mut c_void;
+        type CbFn = unsafe extern "system" fn(*mut c_void, u64, u32);
+        let f: CbFn = unsafe { std::mem::transmute(cb) };
+        unsafe { f(ctx, 1, 0) };
+    }
+    hr
 }
 extern "system" fn xuser_get_id(_: This, _: *const c_void, out: *mut u64) -> HRESULT {
     put(out, 0x0009_0000_0000_0001)
@@ -1179,6 +1190,8 @@ extern "system" fn xuser_reg_change(
     tok: *mut u64,
 ) -> HRESULT {
     boot_trace("xgameruntime", "XUser::RegisterForChangeEvent", &format!("cb={_cb:?} ctx={_ctx:?}"));
+    XUSER_CHANGE_CTX.store(_ctx as usize, Ordering::Release);
+    XUSER_CHANGE_CB.store(_cb as usize, Ordering::Release);
     put(tok, NEXT_TOKEN.fetch_add(1, Ordering::Relaxed))
 }
 extern "system" fn xuser_unreg_change(_: This, _tok: u64, _wait: bool) -> bool {
