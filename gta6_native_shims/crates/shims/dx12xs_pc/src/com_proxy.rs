@@ -1291,6 +1291,10 @@ fn wrap_pipeline_ex(
         parent_dev,
         real_pso,
         used_fallback_rs,
+        diag_dsv_fmt: 0,
+        diag_rtv0_fmt: 0,
+        diag_depth_en: 0,
+        diag_depth_func: 0,
     });
     Box::into_raw(pso).cast()
 }
@@ -1491,6 +1495,15 @@ extern "system" fn dev_create_graphics_pso(
         }
         shim_common::telemetry::record_shader_compiled();
         let wrapped = wrap_pipeline_ex(this, real_pso, used_fallback);
+        if let Some(ref g) = patched_opt {
+            unsafe {
+                let p = &mut *wrapped.cast::<PipelineX>();
+                p.diag_dsv_fmt = g.dsv_format;
+                p.diag_rtv0_fmt = g.rtv_formats[0];
+                p.diag_depth_en = g.depth_stencil_state[0];
+                p.diag_depth_func = g.depth_stencil_state[2];
+            }
+        }
         unsafe { *out = wrapped };
         if let Some(ref g) = patched_opt {
             if g.num_render_targets == 1 && g.rtv_formats[0] == 28 && !used_fallback {
@@ -1902,6 +1915,8 @@ extern "system" fn dev_create_pipeline_state_stream(
     let mut rtv_fmts_logged = [0u32; 8];
     let mut num_rt_logged = 0u32;
     let mut dsv_fmt_logged = 0u32;
+    let mut depth_en_logged = 0u32;
+    let mut depth_fn_logged = 0u32;
     let mut input_elems_logged = 0u32;
     let mut sample_cnt_logged = 0u32;
     let mut tags: Vec<u32> = Vec::new();
@@ -1981,6 +1996,9 @@ extern "system" fn dev_create_pipeline_state_stream(
             let fmt = sanitize_dsv_format(u32::from_le_bytes(pc_stream[off..off + 4].try_into().unwrap()));
             pc_stream[off..off + 4].copy_from_slice(&fmt.to_le_bytes());
             dsv_fmt_logged = fmt;
+        } else if kind == 10 {
+            depth_en_logged = u32::from_le_bytes(pc_stream[dst_off + 8..dst_off + 12].try_into().unwrap());
+            depth_fn_logged = u32::from_le_bytes(pc_stream[dst_off + 16..dst_off + 20].try_into().unwrap());
         } else if kind == 17 {
             sample_cnt_logged = u32::from_le_bytes(pc_stream[dst_off + 4..dst_off + 8].try_into().unwrap());
         } else if kind == 19 {
@@ -2097,7 +2115,14 @@ extern "system" fn dev_create_pipeline_state_stream(
     if hr >= 0 && !real_pso.is_null() {
         shim_common::telemetry::record_shader_compiled();
         let wrapped = wrap_pipeline_ex(this, real_pso, used_fallback);
-        unsafe { *out = wrapped };
+        unsafe {
+            let p = &mut *wrapped.cast::<PipelineX>();
+            p.diag_dsv_fmt = dsv_fmt_logged;
+            p.diag_rtv0_fmt = rtv_fmts_logged[0];
+            p.diag_depth_en = depth_en_logged;
+            p.diag_depth_func = depth_fn_logged;
+            *out = wrapped;
+        }
         static OK_LOGS: AtomicU32 = AtomicU32::new(0);
         if (rtv_fmts_logged[0] == 28 && dsv_fmt_logged == 0 && num_rt_logged == 1)
             && OK_LOGS.fetch_add(1, Ordering::Relaxed) < 64
@@ -4605,6 +4630,10 @@ pub struct PipelineX {
     parent_dev: *mut DeviceX,
     real_pso: *mut c_void,
     used_fallback_rs: bool,
+    diag_dsv_fmt: u32,
+    diag_rtv0_fmt: u32,
+    diag_depth_en: u32,
+    diag_depth_func: u32,
 }
 
 const _: () = assert!(size_of::<PipelineX>() >= 0x40);
@@ -5901,11 +5930,20 @@ extern "system" fn list_set_pso(this: *mut ListX, pso: *mut PipelineX) {
         .store(p_ref.used_fallback_rs, Ordering::Release);
     static SET_PSO_LOGS: AtomicU32 = AtomicU32::new(0);
     let n = SET_PSO_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 32 {
+    static S13_PSO_LOGS: AtomicU32 = AtomicU32::new(0);
+    let s13_n = if crate::read_app_state() == Some(13) {
+        S13_PSO_LOGS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        999
+    };
+    if n <= 32 || s13_n <= 16 {
         boot_trace(
             "dx12xs_pc",
             "ListX::SetPipelineState",
-            &format!("#{n} list={:?} pso={pso:?} real_pso={real_pso:?} fb={}", l.real_list, p_ref.used_fallback_rs),
+            &format!(
+                "#{n}(s13:{s13_n}) list={:?} pso={pso:?} real_pso={real_pso:?} fb={} rtv0={} dsv={} depth_en={} depth_fn={}",
+                l.real_list, p_ref.used_fallback_rs, p_ref.diag_rtv0_fmt, p_ref.diag_dsv_fmt, p_ref.diag_depth_en, p_ref.diag_depth_func
+            ),
         );
     }
     if !real_pso.is_null() {
