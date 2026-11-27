@@ -497,6 +497,29 @@ fn try_alloc_zeroed(len: usize) -> Option<Vec<u8>> {
     Some(v)
 }
 
+fn decode_bcpack(mode: u8, comp: &[u8], dst_len: usize) -> Option<Vec<u8>> {
+    let codec = mode << 2;
+    if codec == sixng_core::bcpack::CODEC_BC1 {
+        if dst_len == 0 || !dst_len.is_multiple_of(8) {
+            return None;
+        }
+        use bcpack::bc1::{QuadTable, Window};
+        static TABLES: std::sync::OnceLock<(Window, QuadTable)> = std::sync::OnceLock::new();
+        let (w, q) = TABLES.get_or_init(|| (Window::default_table(), QuadTable::default_table()));
+        return bcpack::bc1::decode(comp, dst_len / 8, w, q)
+            .ok()
+            .filter(|o| o.blocks.len() == dst_len)
+            .map(|o| o.blocks);
+    }
+    if sixng_core::bcpack::supported(codec) {
+        return sixng_core::bcpack::decode(codec, comp, dst_len)
+            .ok()
+            .filter(|d| d.data.len() == dst_len)
+            .map(|d| d.data);
+    }
+    None
+}
+
 fn execute_request(r: &DStorageRequest) -> HRESULT {
     if r.source.is_null() || r.destination.is_null() {
         return E_INVALIDARG;
@@ -545,22 +568,36 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
         }
     }
 
-    // 2. Decompress if requested (ZLIB supported via zlib-rs).
+    // 2. Decompress if requested (BCPACK + ZLIB).
     let payload: Vec<u8> = if (r.options & OPT_BCPACK_MASK) != 0 {
-        static BCPACK_LOGS: AtomicU32 = AtomicU32::new(0);
-        let bc_n = BCPACK_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-        if bc_n <= 16 || bc_n % 100 == 0 {
-            let head = raw.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-            boot_trace(
-                "xcrd_pc",
-                "IDStorageQueueX::BCPACK_WARN",
-                &format!(
-                    "#{bc_n} options={:#x} src={} dst={} head=[{head}]",
-                    r.options, r.source_size, r.destination_size
-                ),
-            );
+        let mode = ((r.options & OPT_BCPACK_MASK) >> 1) as u8;
+        if let Some(decoded) = decode_bcpack(mode, &raw, dst_len) {
+            static BCPACK_OK_LOGS: AtomicU32 = AtomicU32::new(0);
+            let ok_n = BCPACK_OK_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+            if ok_n <= 8 || ok_n % 200 == 0 {
+                boot_trace(
+                    "xcrd_pc",
+                    "IDStorageQueueX::BCPACK_OK",
+                    &format!("#{ok_n} mode={mode} src={} dst={}", r.source_size, dst_len),
+                );
+            }
+            decoded
+        } else {
+            static BCPACK_LOGS: AtomicU32 = AtomicU32::new(0);
+            let bc_n = BCPACK_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+            if bc_n <= 16 || bc_n % 100 == 0 {
+                let head = raw.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                boot_trace(
+                    "xcrd_pc",
+                    "IDStorageQueueX::BCPACK_FAIL",
+                    &format!(
+                        "#{bc_n} mode={mode} options={:#x} src={} dst={} head=[{head}]",
+                        r.options, r.source_size, r.destination_size
+                    ),
+                );
+            }
+            raw
         }
-        raw
     } else if (r.options & OPT_ZLIB) != 0 {
         let Some(mut out) = try_alloc_zeroed(dst_len) else {
             return E_OUTOFMEMORY;

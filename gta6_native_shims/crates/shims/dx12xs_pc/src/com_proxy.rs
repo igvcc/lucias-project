@@ -1492,6 +1492,26 @@ extern "system" fn dev_create_graphics_pso(
         shim_common::telemetry::record_shader_compiled();
         let wrapped = wrap_pipeline_ex(this, real_pso, used_fallback);
         unsafe { *out = wrapped };
+        if let Some(ref g) = patched_opt {
+            if g.num_render_targets == 1 && g.rtv_formats[0] == 28 && !used_fallback {
+                static PSO28_LOGS: AtomicU32 = AtomicU32::new(0);
+                if PSO28_LOGS.fetch_add(1, Ordering::Relaxed) < 32 {
+                    boot_trace(
+                        "dx12xs_pc",
+                        "DeviceX::CreateGraphicsPSO(rtv28)",
+                        &format!(
+                            "real_pso={real_pso:?} hash={sh_hash:#018x} in_elems={} cull={} depth_en={} depth_func={} blend0_en={} dsv_fmt={}",
+                            g.input_layout_count,
+                            g.rasterizer_state[1],
+                            g.depth_stencil_state[0],
+                            g.depth_stencil_state[2],
+                            g.blend_state[2],
+                            g.dsv_format,
+                        ),
+                    );
+                }
+            }
+        }
         boot_trace_hr(
             "dx12xs_pc",
             "DeviceX::CreateGraphicsPipelineState",
@@ -6180,7 +6200,10 @@ extern "system" fn list_rs_set_viewports(this: *mut ListX, count: u32, vps: *con
         record_list_op(this, "SetVP", 0, u64::from(count));
     }
     static VP_LOGS: AtomicU32 = AtomicU32::new(0);
-    if VP_LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
+    static VP_LATE_LOGS: AtomicU32 = AtomicU32::new(0);
+    let log_vp = VP_LOGS.fetch_add(1, Ordering::Relaxed) < 64
+        || (TOTAL_DRAW_INDEXED.load(Ordering::Relaxed) > 0 && VP_LATE_LOGS.fetch_add(1, Ordering::Relaxed) < 16);
+    if log_vp {
         let vp0 = if count > 0 && !vps.is_null() {
             let f = unsafe { vps.cast::<[f32; 6]>().read_unaligned() };
             format!("({},{},{}x{},d={}..{})", f[0], f[1], f[2], f[3], f[4], f[5])
@@ -6755,7 +6778,10 @@ extern "system" fn list_om_set_render_targets(
         std::ptr::null()
     };
     static OM_LOGS: AtomicU32 = AtomicU32::new(0);
-    if OM_LOGS.fetch_add(1, Ordering::Relaxed) < 128 {
+    static OM_LATE_LOGS: AtomicU32 = AtomicU32::new(0);
+    let log_om = OM_LOGS.fetch_add(1, Ordering::Relaxed) < 128
+        || (TOTAL_DRAW_INDEXED.load(Ordering::Relaxed) > 0 && OM_LATE_LOGS.fetch_add(1, Ordering::Relaxed) < 16);
+    if log_om {
         boot_trace(
             "dx12xs_pc",
             "ListX::OMSetRenderTargets",

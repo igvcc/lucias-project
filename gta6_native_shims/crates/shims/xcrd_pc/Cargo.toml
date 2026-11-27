@@ -12,6 +12,8 @@ crate-type = ["cdylib", "rlib"]
 shim_common = { path = "../shim_common" }
 windows-sys.workspace = true
 zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
+sixng-core = { path = "../../../../6to5m/vendor/sixng-core" }
+bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "5bf5cc56ed56f1ababf1f9592300bd182ff90bd8" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
