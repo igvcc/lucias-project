@@ -681,6 +681,9 @@ pub struct DeviceX {
     null_cb_resource: AtomicUsize,
     synthetic_rs_slots: Mutex<HashMap<usize, crate::SyntheticRootSlots>>,
     failed_rs_stages: Mutex<HashSet<(usize, u8)>>,
+    rs_blobs: Mutex<HashMap<usize, Vec<u8>>>,
+    compute_rs_upgrades: Mutex<HashMap<usize, usize>>,
+    compute_rs_build_lock: Mutex<()>,
     uma_upload_ring: Mutex<Option<UmaUploadRing>>,
 }
 
@@ -794,6 +797,9 @@ pub fn wrap_xbox_device(real_device: *mut c_void, requested_iid: &Guid) -> *mut 
         null_cb_resource: AtomicUsize::new(0),
         synthetic_rs_slots: Mutex::new(HashMap::new()),
         failed_rs_stages: Mutex::new(HashSet::new()),
+        rs_blobs: Mutex::new(HashMap::new()),
+        compute_rs_upgrades: Mutex::new(HashMap::new()),
+        compute_rs_build_lock: Mutex::new(()),
         uma_upload_ring: Mutex::new(None),
     });
     Box::into_raw(dev).cast()
@@ -1291,6 +1297,7 @@ fn wrap_pipeline_ex(
         parent_dev,
         real_pso,
         used_fallback_rs,
+        compute_rs_override: std::ptr::null_mut(),
         diag_dsv_fmt: 0,
         diag_rtv0_fmt: 0,
         diag_depth_en: 0,
@@ -1707,6 +1714,149 @@ fn get_dxpk_fallback_root_sig(d: &DeviceX) -> *mut c_void {
     }
 }
 
+fn get_or_create_compute_rs_upgrade(d: &DeviceX, orig_rs: *mut c_void) -> *mut c_void {
+    if orig_rs.is_null() {
+        return std::ptr::null_mut();
+    }
+    if let Some(&cached) = d
+        .compute_rs_upgrades
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(orig_rs as usize))
+    {
+        return cached as *mut c_void;
+    }
+    let _build_guard = d.compute_rs_build_lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&cached) = d
+        .compute_rs_upgrades
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(orig_rs as usize))
+    {
+        return cached as *mut c_void;
+    }
+    let Some(blob_bytes) = d
+        .rs_blobs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(orig_rs as usize))
+        .cloned()
+    else {
+        return std::ptr::null_mut();
+    };
+    let d3d12 = crate::host_d3d12();
+    if d3d12.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(create_deser) = (unsafe {
+        GetProcAddress(
+            d3d12,
+            c"D3D12CreateVersionedRootSignatureDeserializer".as_ptr().cast(),
+        )
+    }) else {
+        return std::ptr::null_mut();
+    };
+    let Some(ser_proc) = (unsafe {
+        GetProcAddress(
+            d3d12,
+            c"D3D12SerializeVersionedRootSignature".as_ptr().cast(),
+        )
+    }) else {
+        return std::ptr::null_mut();
+    };
+    type DeserFn =
+        unsafe extern "system" fn(*const c_void, usize, *const Guid, *mut *mut c_void) -> HRESULT;
+    type SerFn =
+        unsafe extern "system" fn(*const c_void, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
+    let deser_fn: DeserFn = unsafe { std::mem::transmute(create_deser) };
+    let ser_fn: SerFn = unsafe { std::mem::transmute(ser_proc) };
+    let deser_iid = Guid::new(
+        0x7f91_ce67,
+        0x090c,
+        0x4bb7,
+        [0xb7, 0x8e, 0xed, 0x8f, 0xf2, 0xe3, 0x1d, 0xa0],
+    );
+    let mut deser: *mut c_void = std::ptr::null_mut();
+    if unsafe { deser_fn(blob_bytes.as_ptr().cast(), blob_bytes.len(), &deser_iid, &mut deser) } < 0
+        || deser.is_null()
+    {
+        return std::ptr::null_mut();
+    }
+    type GetUnconvFn =
+        unsafe extern "system" fn(*mut c_void) -> *const crate::D3D12VersionedRootSigDesc;
+    let raw_desc = unsafe { com_slot::<GetUnconvFn>(deser, 4)(deser) };
+    let mut up_rs: *mut c_void = std::ptr::null_mut();
+    if let Some(rd) = unsafe { raw_desc.as_ref() } {
+        let mut sanitized = *rd;
+        let n = rd.desc.num_parameters as usize;
+        let mut params: Vec<[u32; 8]> = Vec::with_capacity(n + 3);
+        if !rd.desc.parameters.is_null() && n > 0 {
+            for i in 0..n {
+                params.push(unsafe { rd.desc.parameters.cast::<[u32; 8]>().add(i).read_unaligned() });
+            }
+        }
+        let desc_flags = if sanitized.version >= 2 { 0x2 } else { 0 };
+        params.push([4, 0, 252, 1, desc_flags, 0, 0, 0]); // UAV u252 space1
+        params.push([3, 0, 254, 1, desc_flags, 0, 0, 0]); // SRV t254 space1
+        params.push([2, 0, 3, 1, desc_flags, 0, 0, 0]); // CBV b3 space1
+        sanitized.desc.num_parameters = params.len() as u32;
+        sanitized.desc.parameters = params.as_ptr().cast();
+        let mut ser_blob: *mut c_void = std::ptr::null_mut();
+        let mut err_blob: *mut c_void = std::ptr::null_mut();
+        let ser_hr = unsafe { ser_fn((&raw const sanitized).cast(), &mut ser_blob, &mut err_blob) };
+        if !err_blob.is_null() {
+            unsafe { real_release(err_blob) };
+        }
+        if ser_hr >= 0 && !ser_blob.is_null() {
+            let vtbl = unsafe { *ser_blob.cast::<*const *const c_void>() };
+            type GetPtrFn = unsafe extern "system" fn(*mut c_void) -> *const c_void;
+            type GetSzFn = unsafe extern "system" fn(*mut c_void) -> usize;
+            let gp: GetPtrFn = unsafe { std::mem::transmute(*vtbl.add(3)) };
+            let gs: GetSzFn = unsafe { std::mem::transmute(*vtbl.add(4)) };
+            let (ptr, len) = (unsafe { gp(ser_blob) }, unsafe { gs(ser_blob) });
+            let rs_iid = Guid::new(
+                0xc54a_6b66,
+                0x72df,
+                0x4ee8,
+                [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14],
+            );
+            type CreateRsFn = unsafe extern "system" fn(
+                *mut c_void,
+                u32,
+                *const c_void,
+                usize,
+                *const Guid,
+                *mut *mut c_void,
+            ) -> HRESULT;
+            let create_hr = unsafe {
+                com_slot::<CreateRsFn>(d.real_device, 16)(
+                    d.real_device,
+                    0,
+                    ptr,
+                    len,
+                    &rs_iid,
+                    &mut up_rs,
+                )
+            };
+            unsafe { real_release(ser_blob) };
+            boot_trace_hr(
+                "dx12xs_pc",
+                "DeviceX::UpgradeComputeRS",
+                create_hr,
+                &format!("orig={orig_rs:?} up={up_rs:?}"),
+            );
+        }
+    }
+    unsafe { real_release(deser) };
+    if !up_rs.is_null() {
+        d.compute_rs_upgrades
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(orig_rs as usize, up_rs as usize);
+    }
+    up_rs
+}
+
 extern "system" fn dev_create_compute_pso(
     this: *mut DeviceX,
     desc: *const c_void,
@@ -1733,6 +1883,7 @@ extern "system" fn dev_create_compute_pso(
     };
     let mut real_pso: *mut c_void = std::ptr::null_mut();
     let mut used_fallback = false;
+    let mut compute_rs_override: *mut c_void = std::ptr::null_mut();
     type FnTy =
         unsafe extern "system" fn(*mut c_void, *const c_void, *const Guid, *mut *mut c_void) -> HRESULT;
     let mut hr = if let Some(ref blob) = pc_dxil {
@@ -1763,10 +1914,9 @@ extern "system" fn dev_create_compute_pso(
             if !skip_try1 {
                 mark_rs_stage_failed(d, orig_rs, 0);
             }
-            let fallback_rs = get_dxpk_fallback_root_sig(d);
-            if !fallback_rs.is_null() {
-                patched.root_signature = fallback_rs;
-                used_fallback = true;
+            let up_rs = get_or_create_compute_rs_upgrade(d, orig_rs);
+            let try_up = if !up_rs.is_null() {
+                patched.root_signature = up_rs;
                 unsafe {
                     com_slot::<FnTy>(real, 11)(
                         real,
@@ -1776,7 +1926,27 @@ extern "system" fn dev_create_compute_pso(
                     )
                 }
             } else {
-                try1
+                E_INVALIDARG
+            };
+            if try_up >= 0 {
+                compute_rs_override = up_rs;
+                try_up
+            } else {
+                let fallback_rs = get_dxpk_fallback_root_sig(d);
+                if !fallback_rs.is_null() {
+                    patched.root_signature = fallback_rs;
+                    used_fallback = true;
+                    unsafe {
+                        com_slot::<FnTy>(real, 11)(
+                            real,
+                            (&raw const patched).cast(),
+                            &PIPELINE_IIDS[0],
+                            &mut real_pso,
+                        )
+                    }
+                } else {
+                    try1
+                }
             }
         } else {
             try1
@@ -1820,6 +1990,9 @@ extern "system" fn dev_create_compute_pso(
         }
         shim_common::telemetry::record_shader_compiled();
         let wrapped = wrap_pipeline_ex(this, real_pso, used_fallback);
+        if !compute_rs_override.is_null() {
+            unsafe { (*(wrapped as *mut PipelineX)).compute_rs_override = compute_rs_override };
+        }
         unsafe { *out = wrapped };
         boot_trace_hr(
             "dx12xs_pc",
@@ -2256,6 +2429,7 @@ extern "system" fn dev_create_command_list(
         closed: AtomicBool::new(false),
         has_real_pso: AtomicBool::new(has_real_pso),
         cur_pso_used_fallback: AtomicBool::new(cur_pso_used_fallback),
+        last_cmp_pso_upgrade: AtomicUsize::new(0),
         uploads: Mutex::new(Vec::new()),
         recent_ops: Mutex::new(([("", 0, 0); 16], 0)),
         last_pso: AtomicUsize::new(real_pso as usize),
@@ -2582,6 +2756,13 @@ extern "system" fn dev_create_root_signature(
     }
     let out_ptr = unsafe { *out };
     if hr >= 0 && !out_ptr.is_null() {
+        if !use_blob.is_null() && use_len > 0 && use_len <= 65536 {
+            let saved = unsafe { std::slice::from_raw_parts(use_blob.cast::<u8>(), use_len) }.to_vec();
+            d.rs_blobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(out_ptr as usize, saved);
+        }
         if let Some(slots) = synthetic_slots {
             d.synthetic_rs_slots
                 .lock()
@@ -4630,6 +4811,7 @@ pub struct PipelineX {
     parent_dev: *mut DeviceX,
     real_pso: *mut c_void,
     used_fallback_rs: bool,
+    compute_rs_override: *mut c_void,
     diag_dsv_fmt: u32,
     diag_rtv0_fmt: u32,
     diag_depth_en: u32,
@@ -5714,6 +5896,7 @@ pub struct ListX {
     closed: AtomicBool,
     has_real_pso: AtomicBool,
     cur_pso_used_fallback: AtomicBool,
+    last_cmp_pso_upgrade: AtomicUsize,
     uploads: Mutex<Vec<(usize, Layout)>>,
     recent_ops: Mutex<ListOpsRing>,
     last_pso: AtomicUsize,
@@ -5928,6 +6111,8 @@ extern "system" fn list_set_pso(this: *mut ListX, pso: *mut PipelineX) {
     l.has_real_pso.store(!real_pso.is_null(), Ordering::Release);
     l.cur_pso_used_fallback
         .store(p_ref.used_fallback_rs, Ordering::Release);
+    l.last_cmp_pso_upgrade
+        .store(p_ref.compute_rs_override as usize, Ordering::Release);
     static SET_PSO_LOGS: AtomicU32 = AtomicU32::new(0);
     let n = SET_PSO_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
     static S13_PSO_LOGS: AtomicU32 = AtomicU32::new(0);
@@ -6526,14 +6711,26 @@ fn bind_synthetic_b0_for_root_sig(this: *mut ListX, real_list: *mut c_void, root
 }
 extern "system" fn list_set_compute_root_sig(this: *mut ListX, root_sig: *mut c_void) {
     let Some(real) = list_open_real(this) else { return; };
-    record_list_op(this, "SetCmpRS", root_sig as u64, 0);
+    let l = unsafe { &*this };
+    let use_rs = if l.last_cmp_pso_upgrade.load(Ordering::Acquire) != 0 && !l.parent_dev.is_null() {
+        let d = unsafe { &*l.parent_dev };
+        d.compute_rs_upgrades
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(root_sig as usize))
+            .copied()
+            .map_or(root_sig, |up| up as *mut c_void)
+    } else {
+        root_sig
+    };
+    record_list_op(this, "SetCmpRS", use_rs as u64, 0);
     static CRS_LOGS: AtomicU32 = AtomicU32::new(0);
     let ln = CRS_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
     if ln <= 128 {
-        boot_trace("dx12xs_pc", "ListX::SetComputeRootSignature", &format!("#{ln} list={real:?} rs={root_sig:?}"));
+        boot_trace("dx12xs_pc", "ListX::SetComputeRootSignature", &format!("#{ln} list={real:?} rs={use_rs:?} orig={root_sig:?}"));
     }
     type FnTy = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    unsafe { com_slot::<FnTy>(real, 29)(real, root_sig) };
+    unsafe { com_slot::<FnTy>(real, 29)(real, use_rs) };
     bind_synthetic_b0_for_root_sig(this, real, root_sig, true);
 }
 extern "system" fn list_set_graphics_root_sig(this: *mut ListX, root_sig: *mut c_void) {
