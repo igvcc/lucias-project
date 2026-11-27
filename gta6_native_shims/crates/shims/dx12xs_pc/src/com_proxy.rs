@@ -3902,7 +3902,7 @@ extern "system" fn dev_create_committed_resource(
         *const Guid,
         *mut *mut c_void,
     ) -> HRESULT;
-    let hr = unsafe {
+    let mut hr = unsafe {
         com_slot::<FnTy>(real, 27)(
             real,
             heap_props,
@@ -3914,6 +3914,24 @@ extern "system" fn dev_create_committed_resource(
             &mut real_res,
         )
     };
+    if hr == (0x8007_000E_u32 as i32) && !heap_props.is_null() && unsafe { (*heap_props)[0] } == 1 {
+        let custom_l0 = [4u32, 1, 1, 0, 0];
+        let hr2 = unsafe {
+            com_slot::<FnTy>(real, 27)(
+                real,
+                &custom_l0,
+                clean_heap_flags,
+                &clean_desc,
+                initial_state,
+                clean_clear,
+                &RESOURCE_IIDS[0],
+                &mut real_res,
+            )
+        };
+        if hr2 >= 0 {
+            hr = hr2;
+        }
+    }
     if hr < 0 {
         log_if_device_removed(real, "DeviceX::CreateCommittedResource", hr);
         drain_info_queue(d.info_queue, "CreateCommittedResource");
