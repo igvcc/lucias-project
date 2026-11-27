@@ -500,6 +500,17 @@ fn translate_cpu_handle_for_ty(xb_handle: u64, expected_ty: Option<u32>) -> Opti
         if xb_handle >= r.xb_start && xb_handle < r.xb_end && r.xb_stride > 0 {
             let idx = (xb_handle - r.xb_start) / u64::from(r.xb_stride);
             let clamped = if r.pc_count > 0 {
+                if idx >= u64::from(r.pc_count) {
+                    static CLAMP_LOGS: AtomicU32 = AtomicU32::new(0);
+                    let cn = CLAMP_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if cn <= 16 || cn.is_power_of_two() {
+                        boot_trace(
+                            "dx12xs_pc",
+                            "DescriptorHandle::gpu_idx_clamped",
+                            &format!("#{cn} idx={idx} pc_count={} xb={xb_handle:#x}", r.pc_count),
+                        );
+                    }
+                }
                 idx.min(u64::from(r.pc_count - 1))
             } else {
                 idx
@@ -541,6 +552,17 @@ fn translate_gpu_handle_with_idx(xb_handle: u64) -> Option<(u64, u32)> {
         if xb_handle >= r.xb_start && xb_handle < r.xb_end && r.xb_stride > 0 {
             let idx = (xb_handle - r.xb_start) / u64::from(r.xb_stride);
             let clamped = if r.pc_count > 0 {
+                if idx >= u64::from(r.pc_count) {
+                    static CLAMP_LOGS: AtomicU32 = AtomicU32::new(0);
+                    let cn = CLAMP_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if cn <= 16 || cn.is_power_of_two() {
+                        boot_trace(
+                            "dx12xs_pc",
+                            "DescriptorHandle::gpu_idx_clamped",
+                            &format!("#{cn} idx={idx} pc_count={} xb={xb_handle:#x}", r.pc_count),
+                        );
+                    }
+                }
                 idx.min(u64::from(r.pc_count - 1))
             } else {
                 idx
@@ -2700,14 +2722,10 @@ extern "system" fn dev_create_descriptor_heap(
     let d = unsafe { &*this };
     let mut pc_desc = desc;
     pc_desc.flags &= 1; // Strip Xbox-only descriptor heap flags
-    // Win32 D3D12 caps SHADER_VISIBLE CBV_SRV_UAV heaps at 1,000,000 (Tier 2 limit).
+    // Win32 D3D12 Tier 2 caps SHADER_VISIBLE CBV_SRV_UAV heaps at 1,000,000,
+    // while Tier 3 hardware supports > 1,000,000. Try the requested size first
+    // and only clamp to 1,000,000 if CreateDescriptorHeap rejects it.
     const MAX_PC_SHADER_VISIBLE_CBV_SRV_UAV: u32 = 1_000_000;
-    if pc_desc.ty == 0
-        && (pc_desc.flags & 1) != 0
-        && pc_desc.num_descriptors > MAX_PC_SHADER_VISIBLE_CBV_SRV_UAV
-    {
-        pc_desc.num_descriptors = MAX_PC_SHADER_VISIBLE_CBV_SRV_UAV;
-    }
     let mut real_heap: *mut c_void = std::ptr::null_mut();
     type FnTy = unsafe extern "system" fn(
         *mut c_void,
@@ -2715,9 +2733,20 @@ extern "system" fn dev_create_descriptor_heap(
         *const Guid,
         *mut *mut c_void,
     ) -> HRESULT;
-    let hr = unsafe {
+    let mut hr = unsafe {
         com_slot::<FnTy>(d.real_device, 14)(d.real_device, &pc_desc, &DESC_HEAP_IIDS[0], &mut real_heap)
     };
+    if (hr < 0 || real_heap.is_null())
+        && pc_desc.ty == 0
+        && (pc_desc.flags & 1) != 0
+        && pc_desc.num_descriptors > MAX_PC_SHADER_VISIBLE_CBV_SRV_UAV
+    {
+        pc_desc.num_descriptors = MAX_PC_SHADER_VISIBLE_CBV_SRV_UAV;
+        real_heap = std::ptr::null_mut();
+        hr = unsafe {
+            com_slot::<FnTy>(d.real_device, 14)(d.real_device, &pc_desc, &DESC_HEAP_IIDS[0], &mut real_heap)
+        };
+    }
     log_if_device_removed(d.real_device, "DeviceX::CreateDescriptorHeap", hr);
     drain_info_queue(d.info_queue, "CreateDescriptorHeap");
     boot_trace_hr(
@@ -6918,6 +6947,14 @@ fn bind_userdata_b0_for_table0(this: *mut ListX, real_list: *mut c_void, desc_id
         let mut ud = [0u32; 12];
         ud[8] = desc_idx.wrapping_mul(32);
         if let Some(cb_va) = upload_cpu_slice_to_gpu_va(d, ud.as_ptr() as u64, 48, 256, 256) {
+            static S13_UD_LOGS: AtomicU32 = AtomicU32::new(0);
+            if crate::read_app_state() == Some(13) && S13_UD_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                boot_trace(
+                    "dx12xs_pc",
+                    "ListX::bind_userdata_b0(s13)",
+                    &format!("list={real_list:?} rs={rs:#x} b0={b0_idx} desc_idx={desc_idx} ud8={:#x} cb_va={cb_va:#x}", ud[8]),
+                );
+            }
             let cbv_slot = if is_compute { 37 } else { 38 };
             type ViewFn = unsafe extern "system" fn(*mut c_void, u32, u64);
             unsafe { com_slot::<ViewFn>(real_list, cbv_slot)(real_list, b0_idx, cb_va) };
