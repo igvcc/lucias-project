@@ -25,9 +25,10 @@ const X64_CONTEXT_RIP_OFFSET: usize = 0xF8;
 const MAIN_EXE_IMAGE_SPAN: usize = 0x0B06_D000;
 const RVA_COUNT_CHUNKS_INT3: usize = 0x051D_251E;
 const RVA_COUNT_CHUNKS_RET: usize = 0x051D_250E;
+const RVA_DSTORAGE_EOF_INT3: usize = 0x04FF_D859;
+const RVA_DSTORAGE_EOF_RET: usize = 0x04FF_D852;
 const NONFATAL_DEV_ASSERT_RVAS: &[usize] = &[
     0x04DC_BC9D,
-    0x04FF_D859,
     0x04FF_D85F,
     0x04FF_D868,
     0x04FF_D879,
@@ -67,6 +68,8 @@ extern "system" {
 pub(crate) fn dev_assert_next_rva(rva: usize) -> Option<usize> {
     if rva == RVA_COUNT_CHUNKS_INT3 {
         Some(RVA_COUNT_CHUNKS_RET)
+    } else if rva == RVA_DSTORAGE_EOF_INT3 {
+        Some(RVA_DSTORAGE_EOF_RET)
     } else if NONFATAL_DEV_ASSERT_RVAS.contains(&rva) {
         Some(rva + 1)
     } else {
@@ -216,6 +219,16 @@ unsafe extern "system" fn dev_assert_veh(info: *mut ExceptionPointersRaw) -> i32
             ctx.add(X64_CONTEXT_RIP_OFFSET)
                 .cast::<u64>()
                 .write_unaligned(next_rip as u64);
+            // At `0x04FF_D868` (mid-chunk read on a compressed TTDB/RPF chunk), `[rsp+0x20]` (`r13`)
+            // differs from `rsi` (`chunk_uncomp_offset`), causing `0x4FFD6DA` to corrupt `source_offset`.
+            // Align `[rsp+0x20] = rsi` so `source_offset` stays at the compressed chunk start.
+            if rva == 0x04FF_D868 {
+                let rsp = ctx.add(X64_CONTEXT_RSP_OFFSET).cast::<u64>().read_unaligned() as usize;
+                let rsi = ctx.add(X64_CONTEXT_RSP_OFFSET + 0x10).cast::<u64>().read_unaligned();
+                if rsp != 0 {
+                    ((rsp + 0x20) as *mut u64).write_unaligned(rsi);
+                }
+            }
         }
         static SKIP_LOGS: AtomicU32 = AtomicU32::new(0);
         static REDIRECT_LOGS: AtomicU32 = AtomicU32::new(0);
