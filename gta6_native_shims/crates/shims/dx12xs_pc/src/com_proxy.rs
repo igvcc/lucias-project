@@ -678,6 +678,16 @@ struct UmaCbvPool {
 }
 unsafe impl Send for UmaCbvPool {}
 
+struct ShadowUploadHelper {
+    queue: *mut c_void,
+    alloc: *mut c_void,
+    list: *mut c_void,
+    fence: *mut c_void,
+    event: *mut c_void,
+    fence_val: u64,
+}
+unsafe impl Send for ShadowUploadHelper {}
+
 pub(crate) fn align_and_wrap_ring_offset(
     cursor: usize,
     ring_size: usize,
@@ -719,6 +729,7 @@ pub struct DeviceX {
     compute_rs_build_lock: Mutex<()>,
     uma_upload_ring: Mutex<Option<UmaUploadRing>>,
     uma_cbv_pool: Mutex<Option<UmaCbvPool>>,
+    shadow_upload: Mutex<Option<ShadowUploadHelper>>,
 }
 
 const _: () = assert!(std::mem::offset_of!(DeviceX, out_of_line) == 0x18);
@@ -836,6 +847,7 @@ pub fn wrap_xbox_device(real_device: *mut c_void, requested_iid: &Guid) -> *mut 
         compute_rs_build_lock: Mutex::new(()),
         uma_upload_ring: Mutex::new(None),
         uma_cbv_pool: Mutex::new(None),
+        shadow_upload: Mutex::new(None),
     });
     Box::into_raw(dev).cast()
 }
@@ -863,6 +875,7 @@ fn create_mapped_upload_buffer(
     real_device: *mut c_void,
     size: usize,
     tag: &str,
+    register_range: bool,
 ) -> Option<(*mut c_void, *mut u8, u64)> {
     let heap_props: [u32; 5] = [2, 0, 0, 0, 0]; // D3D12_HEAP_TYPE_UPLOAD
     let desc = ResourceDescRaw {
@@ -920,10 +933,12 @@ fn create_mapped_upload_buffer(
         unsafe { real_release(res) };
         return None;
     }
-    GPU_RESOURCE_RANGES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((gpu_va, size as u64));
+    if register_range {
+        GPU_RESOURCE_RANGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((gpu_va, size as u64));
+    }
     boot_trace_hr(
         "dx12xs_pc",
         tag,
@@ -957,6 +972,7 @@ fn upload_cpu_slice_to_gpu_va(
             d.real_device,
             UMA_UPLOAD_RING_SIZE,
             "DeviceX::UmaUploadRing::init",
+            true,
         )?;
         *guard = Some(UmaUploadRing {
             res,
@@ -1001,6 +1017,7 @@ fn alloc_or_reuse_uma_cbv(
             d.real_device,
             UMA_CBV_POOL_SIZE,
             "DeviceX::UmaCbvPool::init",
+            true,
         )?;
         *guard = Some(UmaCbvPool {
             res,
@@ -1243,6 +1260,23 @@ extern "system" fn dev_release(this: *mut DeviceX) -> u32 {
             unregister_gpu_buffer_va(pool.gpu_va);
             if !pool.res.is_null() {
                 unsafe { real_release(pool.res) };
+            }
+        }
+        if let Some(sh) = boxed.shadow_upload.into_inner().ok().flatten() {
+            if !sh.fence.is_null() {
+                unsafe { real_release(sh.fence) };
+            }
+            if !sh.list.is_null() {
+                unsafe { real_release(sh.list) };
+            }
+            if !sh.alloc.is_null() {
+                unsafe { real_release(sh.alloc) };
+            }
+            if !sh.queue.is_null() {
+                unsafe { real_release(sh.queue) };
+            }
+            if !sh.event.is_null() {
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(sh.event) };
             }
         }
         if !boxed.info_queue.is_null() {
@@ -5256,17 +5290,258 @@ extern "system" fn res_map(
     }
     hr
 }
+fn upload_shadow_to_real(r: &ResourceX, sub: u32) {
+    let shadow_addr = r
+        .cpu_map_buf
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(0);
+    if shadow_addr == 0 || r.real_resource.is_null() || r.parent_dev.is_null() {
+        return;
+    }
+    let d = unsafe { &*r.parent_dev };
+    if d.real_device.is_null() {
+        return;
+    }
+    let shadow_ptr = shadow_addr as *const u8;
+    let shadow_bytes = resource_shadow_bytes(&r.desc);
+    if shadow_bytes == 0 {
+        return;
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct PlacedFootprintRaw {
+        offset: u64,
+        format: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        row_pitch: u32,
+        _pad: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawTexCopyLoc {
+        resource: *mut c_void,
+        ty: u32,
+        _pad: u32,
+        payload: [u64; 4],
+    }
+
+    let (staging_res, staging_mapped, copy_bytes, footprint_opt) = if r.desc.dimension == 1 {
+        let bytes = usize::try_from(r.desc.width).unwrap_or(0).min(shadow_bytes);
+        if bytes == 0 {
+            return;
+        }
+        let Some((res, mapped, _va)) =
+            create_mapped_upload_buffer(d.real_device, bytes, "ShadowUpload::buf", false)
+        else {
+            return;
+        };
+        unsafe { std::ptr::copy_nonoverlapping(shadow_ptr, mapped, bytes) };
+        (res, mapped, bytes, None)
+    } else {
+        type FootprintsFn = unsafe extern "system" fn(
+            *mut c_void,
+            *const ResourceDescRaw,
+            u32,
+            u32,
+            u64,
+            *mut PlacedFootprintRaw,
+            *mut u32,
+            *mut u64,
+            *mut u64,
+        );
+        type GetDescFn = unsafe extern "system" fn(*mut c_void, *mut ResourceDescRaw) -> *mut ResourceDescRaw;
+        let mut clean_desc = r.desc;
+        unsafe { com_slot::<GetDescFn>(r.real_resource, 10)(r.real_resource, &mut clean_desc) };
+        let mut fp = PlacedFootprintRaw::default();
+        let mut num_rows = 0u32;
+        let mut row_size = 0u64;
+        let mut total_bytes = 0u64;
+        unsafe {
+            com_slot::<FootprintsFn>(d.real_device, 38)(
+                d.real_device,
+                &clean_desc,
+                sub,
+                1,
+                0,
+                &mut fp,
+                &mut num_rows,
+                &mut row_size,
+                &mut total_bytes,
+            );
+        }
+        let total = usize::try_from(total_bytes).unwrap_or(0);
+        let rows = usize::try_from(num_rows).unwrap_or(0) * usize::try_from(fp.depth.max(1)).unwrap_or(1);
+        let rsize = usize::try_from(row_size).unwrap_or(0);
+        let dpitch = usize::try_from(fp.row_pitch).unwrap_or(0);
+        if total == 0 || rows == 0 || rsize == 0 || dpitch < rsize {
+            return;
+        }
+        let Some((res, mapped, _va)) =
+            create_mapped_upload_buffer(d.real_device, total, "ShadowUpload::tex", false)
+        else {
+            return;
+        };
+        let copy_rows = rows.min(shadow_bytes / rsize);
+        for row in 0..copy_rows {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    shadow_ptr.add(row * rsize),
+                    mapped.add(fp.offset as usize + row * dpitch),
+                    rsize,
+                );
+            }
+        }
+        (res, mapped, total, Some(fp))
+    };
+    let _ = (staging_mapped, copy_bytes);
+
+    let mut guard = d.shadow_upload.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        type CreateQFn = unsafe extern "system" fn(*mut c_void, *const [u32; 4], *const Guid, *mut *mut c_void) -> HRESULT;
+        type CreateAFn = unsafe extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> HRESULT;
+        type CreateLFn = unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> HRESULT;
+        type CreateFFn = unsafe extern "system" fn(*mut c_void, u64, u32, *const Guid, *mut *mut c_void) -> HRESULT;
+        let qdesc = [0u32; 4];
+        let mut queue = std::ptr::null_mut();
+        let mut alloc = std::ptr::null_mut();
+        let mut list = std::ptr::null_mut();
+        let mut fence = std::ptr::null_mut();
+        let hr_q = unsafe { com_slot::<CreateQFn>(d.real_device, 8)(d.real_device, &qdesc, &QUEUE_IIDS[0], &mut queue) };
+        let hr_a = if hr_q >= 0 { unsafe { com_slot::<CreateAFn>(d.real_device, 9)(d.real_device, 0, &ALLOCATOR_IIDS[0], &mut alloc) } } else { hr_q };
+        let hr_l = if hr_a >= 0 { unsafe { com_slot::<CreateLFn>(d.real_device, 12)(d.real_device, 0, 0, alloc, std::ptr::null_mut(), &LIST_IIDS[0], &mut list) } } else { hr_a };
+        let hr_f = if hr_l >= 0 { unsafe { com_slot::<CreateFFn>(d.real_device, 36)(d.real_device, 0, 0, &FENCE_IIDS[0], &mut fence) } } else { hr_l };
+        let event = unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if hr_f < 0 || queue.is_null() || alloc.is_null() || list.is_null() || fence.is_null() || event.is_null() {
+            if !fence.is_null() { unsafe { real_release(fence) }; }
+            if !list.is_null() { unsafe { real_release(list) }; }
+            if !alloc.is_null() { unsafe { real_release(alloc) }; }
+            if !queue.is_null() { unsafe { real_release(queue) }; }
+            if !event.is_null() { unsafe { windows_sys::Win32::Foundation::CloseHandle(event) }; }
+            unsafe { real_release(staging_res) };
+            return;
+        }
+        // Close initial open list so the loop can consistently Reset(alloc) + Reset(list).
+        type CloseFn = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+        let _ = unsafe { com_slot::<CloseFn>(list, 9)(list) };
+        *guard = Some(ShadowUploadHelper {
+            queue,
+            alloc,
+            list,
+            fence,
+            event,
+            fence_val: 0,
+        });
+    }
+    let Some(sh) = guard.as_mut() else {
+        unsafe { real_release(staging_res) };
+        return;
+    };
+
+    type AllocResetFn = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+    type ListResetFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT;
+    type CloseFn = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+    type CopyBufFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64);
+    type CopyTexFn = unsafe extern "system" fn(*mut c_void, *const RawTexCopyLoc, u32, u32, u32, *const RawTexCopyLoc, *const c_void);
+    type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    type SigFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT;
+    type SetEvtFn = unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT;
+
+    let hr_ar = unsafe { com_slot::<AllocResetFn>(sh.alloc, 8)(sh.alloc) };
+    let hr_lr = if hr_ar >= 0 {
+        unsafe { com_slot::<ListResetFn>(sh.list, 10)(sh.list, sh.alloc, std::ptr::null_mut()) }
+    } else {
+        hr_ar
+    };
+    let mut hr_cl = 0i32;
+    if hr_lr >= 0 {
+        if let Some(fp) = footprint_opt {
+            let dst = RawTexCopyLoc {
+                resource: r.real_resource,
+                ty: 1, // SUBRESOURCE_INDEX
+                _pad: 0,
+                payload: [u64::from(sub), 0, 0, 0],
+            };
+            let payload: [u64; 4] = unsafe { std::mem::transmute(fp) };
+            let src = RawTexCopyLoc {
+                resource: staging_res,
+                ty: 0, // PLACED_FOOTPRINT
+                _pad: 0,
+                payload,
+            };
+            unsafe {
+                com_slot::<CopyTexFn>(sh.list, 16)(
+                    sh.list,
+                    &dst,
+                    0,
+                    0,
+                    0,
+                    &src,
+                    std::ptr::null(),
+                );
+            }
+        } else {
+            unsafe {
+                com_slot::<CopyBufFn>(sh.list, 15)(
+                    sh.list,
+                    r.real_resource,
+                    0,
+                    staging_res,
+                    0,
+                    r.desc.width,
+                );
+            }
+        }
+        hr_cl = unsafe { com_slot::<CloseFn>(sh.list, 9)(sh.list) };
+        if hr_cl >= 0 {
+            let lists = [sh.list];
+            unsafe { com_slot::<ExecFn>(sh.queue, 10)(sh.queue, 1, lists.as_ptr()) };
+            sh.fence_val += 1;
+            let val = sh.fence_val;
+            if unsafe { com_slot::<SigFn>(sh.queue, 14)(sh.queue, sh.fence, val) } >= 0
+                && unsafe { com_slot::<SetEvtFn>(sh.fence, 9)(sh.fence, val, sh.event) } >= 0
+            {
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitForSingleObject(sh.event, 5000);
+                }
+            }
+        }
+    }
+    unsafe { real_release(staging_res) };
+    drain_info_queue(d.info_queue, "ShadowUpload");
+
+    static UPLOAD_LOGS: AtomicU32 = AtomicU32::new(0);
+    let un = UPLOAD_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+    if un <= 16 {
+        boot_trace(
+            "dx12xs_pc",
+            "ResourceX::Unmap(shadow-upload)",
+            &format!(
+                "#{un} real={:?} sub={sub} dim={} w={} h={} fmt={} hr_ar={hr_ar:#x} hr_lr={hr_lr:#x} hr_cl={hr_cl:#x}",
+                r.real_resource, r.desc.dimension, r.desc.width, r.desc.height, r.desc.format
+            ),
+        );
+    }
+}
+
 extern "system" fn res_unmap(this: *mut ResourceX, sub: u32, range: *const c_void) {
     if this.is_null() {
         return;
     }
     let r = unsafe { &*this };
-    if (r.heap_ty != 2 && r.heap_ty != 3)
-        || r.cpu_map_buf
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-    {
+    let has_shadow = r
+        .cpu_map_buf
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|a| a != 0);
+    if has_shadow {
+        upload_shadow_to_real(r, sub);
+        return;
+    }
+    if r.heap_ty != 2 && r.heap_ty != 3 {
         return;
     }
     let real = r.real_resource;
