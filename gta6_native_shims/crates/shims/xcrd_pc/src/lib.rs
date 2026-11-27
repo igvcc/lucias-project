@@ -591,8 +591,8 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
                     "xcrd_pc",
                     "IDStorageQueueX::BCPACK_FAIL",
                     &format!(
-                        "#{bc_n} mode={mode} options={:#x} src={} dst={} head=[{head}]",
-                        r.options, r.source_size, r.destination_size
+                        "#{bc_n} mode={mode} options={:#x} src={} dst={} interm={} poff={:#x} soff={:#x} head=[{head}]",
+                        r.options, r.source_size, r.destination_size, r.intermediate_size, r.page_offset, r.source_offset
                     ),
                 );
             }
