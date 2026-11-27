@@ -1073,6 +1073,23 @@ fn alloc_or_reuse_uma_cbv(
         alloc_bytes,
     });
     pool.by_xb_va.insert(cpu_va, idx);
+    if copy_bytes == 96 && crate::read_app_state() == Some(13) {
+        static S13_96B_LOGS: AtomicU32 = AtomicU32::new(0);
+        let n96 = S13_96B_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n96 <= 8 {
+            let mut w = [0u32; 8];
+            for (i, out) in w.iter_mut().enumerate() {
+                *out = unsafe { pc_ptr.cast::<u32>().add(i).read_unaligned() };
+            }
+            boot_trace(
+                "dx12xs_pc",
+                "UmaCbvPool::s13_96b",
+                &format!("#{n96} xb={cpu_va:#x}->pc={pc_va:#x} w=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
+                ),
+            );
+        }
+    }
     Some(pc_va)
 }
 
@@ -1641,6 +1658,19 @@ extern "system" fn dev_create_graphics_pso(
             ptr: std::ptr::null(),
             len: 0,
         };
+        if primary_hash == 0xcc7a1fd71cd7f6b2 {
+            boot_trace(
+                "dx12xs_pc",
+                "DeviceX::CreateGraphicsPipelineState(s13_5_VS)",
+                &format!(
+                    "smask={:#x} blend0=[en={},src={},dst={},op={},wmask={:#x}] rast=[fill={},cull={},ccw={}] nrt={} rtv0={} il_cnt={}",
+                    g.sample_mask,
+                    g.blend_state[2], g.blend_state[4], g.blend_state[5], g.blend_state[6], g.blend_state[11],
+                    g.rasterizer_state[0], g.rasterizer_state[1], g.rasterizer_state[2],
+                    g.num_render_targets, g.rtv_formats[0], g.input_layout_count
+                ),
+            );
+        }
         Some(g)
     } else {
         None
@@ -5461,14 +5491,14 @@ fn upload_shadow_to_real(r: &ResourceX, sub: u32) {
         if let Some(fp) = footprint_opt {
             let dst = RawTexCopyLoc {
                 resource: r.real_resource,
-                ty: 1, // SUBRESOURCE_INDEX
+                ty: 0, // D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
                 _pad: 0,
                 payload: [u64::from(sub), 0, 0, 0],
             };
             let payload: [u64; 4] = unsafe { std::mem::transmute(fp) };
             let src = RawTexCopyLoc {
                 resource: staging_res,
-                ty: 0, // PLACED_FOOTPRINT
+                ty: 1, // D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT
                 _pad: 0,
                 payload,
             };
@@ -5516,12 +5546,18 @@ fn upload_shadow_to_real(r: &ResourceX, sub: u32) {
     static UPLOAD_LOGS: AtomicU32 = AtomicU32::new(0);
     let un = UPLOAD_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
     if un <= 16 {
+        let fp_info = footprint_opt.map(|f| {
+            format!(
+                "fp=(off={} fmt={} {}x{}x{} pitch={})",
+                f.offset, f.format, f.width, f.height, f.depth, f.row_pitch
+            )
+        }).unwrap_or_default();
         boot_trace(
             "dx12xs_pc",
             "ResourceX::Unmap(shadow-upload)",
             &format!(
-                "#{un} real={:?} sub={sub} dim={} w={} h={} fmt={} hr_ar={hr_ar:#x} hr_lr={hr_lr:#x} hr_cl={hr_cl:#x}",
-                r.real_resource, r.desc.dimension, r.desc.width, r.desc.height, r.desc.format
+                "#{un} real={:?} sub={sub} dim={} w={} h={} arr={} mips={} fmt={} hr_ar={hr_ar:#x} hr_lr={hr_lr:#x} hr_cl={hr_cl:#x} {fp_info}",
+                r.real_resource, r.desc.dimension, r.desc.width, r.desc.height, r.desc.depth_or_array, r.desc.mip_levels, r.desc.format
             ),
         );
     }
