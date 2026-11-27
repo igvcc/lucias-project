@@ -1090,11 +1090,12 @@ impl PresentContext {
             let write_ok = std::fs::write(&path, &ppm).is_ok();
             written_info = format!(" ppm={} written={write_ok}", path.display());
         }
+        let (scr_threads, save_state) = crate::read_boot_diag();
         boot_trace(
             "dx12xs_pc",
             "PresentContext::frame_stats",
             &format!(
-                "tick={tick} elapsed_s={elapsed_s:.1}s tag={tag} app_state={app_state:?} w={w} h={h} fmt={fmt} nonzero_px={nz} draws={draws:?} sc_hr={sc_hr:#010x} sample_rgba=[center={center:?} quarter={quarter:?}]{written_info}"
+                "tick={tick} elapsed_s={elapsed_s:.1}s tag={tag} app_state={app_state:?} scr={scr_threads:?} save={save_state:?} w={w} h={h} fmt={fmt} nonzero_px={nz} draws={draws:?} sc_hr={sc_hr:#010x} sample_rgba=[center={center:?} quarter={quarter:?}]{written_info}"
             ),
         );
     }

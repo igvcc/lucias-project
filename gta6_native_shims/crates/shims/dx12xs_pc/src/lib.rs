@@ -90,6 +90,17 @@ pub(crate) fn read_app_state() -> Option<u32> {
     safe_read_copy::<u32>(base.saturating_add(RVA_APP_STATE))
 }
 
+pub(crate) fn read_boot_diag() -> (Option<u32>, Option<u32>) {
+    let base = MAIN_EXE_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return (None, None);
+    }
+    (
+        safe_read_copy::<u32>(base.saturating_add(0x078C_CD68)),
+        safe_read_copy::<u32>(base.saturating_add(0x078B_2818)),
+    )
+}
+
 pub(crate) fn maybe_diag_advance_boot_stage() {
     if !*DIAG_ADVANCE_BOOT {
         return;

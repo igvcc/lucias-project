@@ -2099,10 +2099,12 @@ extern "system" fn dev_create_pipeline_state_stream(
         let wrapped = wrap_pipeline_ex(this, real_pso, used_fallback);
         unsafe { *out = wrapped };
         static OK_LOGS: AtomicU32 = AtomicU32::new(0);
-        if OK_LOGS.fetch_add(1, Ordering::Relaxed) < 256 {
+        if (rtv_fmts_logged[0] == 28 && dsv_fmt_logged == 0 && num_rt_logged == 1)
+            && OK_LOGS.fetch_add(1, Ordering::Relaxed) < 64
+        {
             boot_trace_hr(
                 "dx12xs_pc",
-                "DeviceX::CreatePipelineState",
+                "DeviceX::CreatePipelineState(rtv28_nodsv)",
                 S_OK,
                 &format!(
                     "out={real_pso:?} stage={primary_stage} hash={primary_hash:#018x} fallback_rs={used_fallback} bytes={} rtv={rtv_fmts_logged:?} num_rt={num_rt_logged} dsv={dsv_fmt_logged} tags={tags:?}",
