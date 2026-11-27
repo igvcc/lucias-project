@@ -5887,7 +5887,7 @@ extern "system" fn list_set_pso(this: *mut ListX, pso: *mut PipelineX) {
     }
 }
 static TOTAL_DRAW_INSTANCED: AtomicU64 = AtomicU64::new(0);
-static TOTAL_DRAW_INDEXED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TOTAL_DRAW_INDEXED: AtomicU64 = AtomicU64::new(0);
 static TOTAL_DISPATCH: AtomicU64 = AtomicU64::new(0);
 static TOTAL_EXEC_INDIRECT: AtomicU64 = AtomicU64::new(0);
 

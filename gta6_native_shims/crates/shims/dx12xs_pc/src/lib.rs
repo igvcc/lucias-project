@@ -95,7 +95,27 @@ pub(crate) fn maybe_diag_advance_boot_stage() {
         return;
     }
     let base = MAIN_EXE_BASE.load(Ordering::Relaxed);
-    if base == 0 || read_app_state() != Some(3) {
+    if base == 0 {
+        return;
+    }
+    let app_state = read_app_state();
+    if app_state == Some(13) {
+        static SHUTDOWN_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if crate::com_proxy::TOTAL_DRAW_INDEXED.load(Ordering::Relaxed) >= 5_000
+            && !SHUTDOWN_SENT.swap(true, Ordering::AcqRel)
+        {
+            let fn_ptr = (base.saturating_add(0x021B_8DE0)) as *const ();
+            let shutdown_fn: extern "C" fn() -> u8 = unsafe { std::mem::transmute(fn_ptr) };
+            let rc = shutdown_fn();
+            boot_trace(
+                "dx12xs_pc",
+                "PresentContext::diag_shutdown_loading_screen",
+                &format!("called RVA 0x21b8de0 -> rc={rc}"),
+            );
+        }
+        return;
+    }
+    if app_state != Some(3) {
         return;
     }
     let state_ptr = safe_read_copy::<usize>(base.saturating_add(RVA_STATE_PTR)).unwrap_or(0);
