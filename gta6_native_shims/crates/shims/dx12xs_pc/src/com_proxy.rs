@@ -3261,6 +3261,14 @@ extern "system" fn dev_create_srv(
     };
     let mut desc_scratch = ViewDesc40([0; 10]);
     let pc_desc = patch_view_desc_remapped(res, desc, &mut desc_scratch);
+    static S13_SRV_LOGS: AtomicU32 = AtomicU32::new(0);
+    if crate::read_app_state() == Some(13) && S13_SRV_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+        boot_trace(
+            "dx12xs_pc",
+            "DeviceX::CreateShaderResourceView(s13)",
+            &format!("res={real_res:?} pc_cpu={pc_cpu:#x} fmt={} dim={}", desc_scratch.0[0], desc_scratch.0[1]),
+        );
+    }
     type FnTy = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, u64);
     unsafe { com_slot::<FnTy>(real, 18)(real, real_res, pc_desc, pc_cpu) };
     log_view_device_removed_once(real, "CreateShaderResourceView", res, pc_desc);
@@ -3515,12 +3523,20 @@ extern "system" fn dev_copy_descriptors_simple(
         translate_cpu_handle_for_ty(dst, Some(heap_ty)),
         translate_cpu_handle_for_ty(src, Some(heap_ty)),
     ) else {
+        static FAIL_LOGS: AtomicU32 = AtomicU32::new(0);
+        if heap_ty == 0 && FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+            boot_trace("dx12xs_pc", "DeviceX::CopyDescriptorsSimple(FAIL)", &format!("n={n} ty={heap_ty} dst={dst:#x} src={src:#x}"));
+        }
         return;
     };
     static COPY_SIMPLE_LOGS: AtomicU32 = AtomicU32::new(0);
     static S13_COPY_SIMPLE_LOGS: AtomicU32 = AtomicU32::new(0);
-    let s13_copy = heap_ty == 0 && crate::read_app_state() == Some(13) && S13_COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 16;
-    if (heap_ty == 0 && COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 8) || s13_copy {
+    static HIGH_COPY_LOGS: AtomicU32 = AtomicU32::new(0);
+    let s13_copy = heap_ty == 0
+        && crate::read_app_state() == Some(13)
+        && S13_COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 32;
+    let high_copy = heap_ty == 0 && dst >= 0x1da0_0000 && dst <= 0x1eb0_0000 && HIGH_COPY_LOGS.fetch_add(1, Ordering::Relaxed) < 16;
+    if (heap_ty == 0 && COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 8) || s13_copy || high_copy {
         boot_trace("dx12xs_pc", "DeviceX::CopyDescriptorsSimple(ty0)", &format!("n={n} ty={heap_ty} s13={s13_copy} dst={dst:#x}->{pc_dst:#x} src={src:#x}->{pc_src:#x}"));
     }
     let real = unsafe { &*this }.real_device;
@@ -4900,10 +4916,14 @@ extern "system" fn dev_create_sampler_x(
 
 extern "system" fn dev_create_placed_view_x(
     _this: *mut DeviceX,
-    _res: *mut c_void,
-    _desc: *const c_void,
-    _cpu: u64,
+    res: *mut c_void,
+    desc: *const c_void,
+    cpu: u64,
 ) -> HRESULT {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+        boot_trace("dx12xs_pc", "DeviceX::CreatePlacedViewX", &format!("res={res:?} desc={desc:?} cpu={cpu:#x}"));
+    }
     S_OK
 }
 

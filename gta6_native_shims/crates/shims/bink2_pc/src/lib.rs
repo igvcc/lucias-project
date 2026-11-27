@@ -69,17 +69,23 @@ pub extern "C" fn BinkOpenWithOptions(
         unsafe { CStr::from_ptr(effective_name) }.to_string_lossy().into_owned()
     };
 
+    static BINK_OPEN_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = BINK_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     type FnTy = extern "C" fn(*const c_char, *const c_void, u32) -> *mut BinkHandle;
     if let Some(f) = unsafe { proc_or_none::<FnTy>(c"BinkOpenWithOptions") } {
-        shim_common::boot_trace("bink2_pc", "BinkOpenWithOptions", &format!("file={name_log} flags={flags:#x}"));
+        if n <= 4 || n.is_power_of_two() {
+            shim_common::boot_trace("bink2_pc", "BinkOpenWithOptions", &format!("#{n} file={name_log} flags={flags:#x}"));
+        }
         return f(effective_name, open_options, flags);
     }
 
-    shim_common::boot_trace(
-        "bink2_pc",
-        "BinkOpenWithOptions",
-        &format!("file={name_log} flags={flags:#x} -> returning NULL (skip movie cleanly)"),
-    );
+    if n <= 4 || n.is_power_of_two() {
+        shim_common::boot_trace(
+            "bink2_pc",
+            "BinkOpenWithOptions",
+            &format!("#{n} file={name_log} flags={flags:#x} -> returning NULL (skip movie cleanly)"),
+        );
+    }
     std::ptr::null_mut()
 }
 
