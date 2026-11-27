@@ -1059,6 +1059,7 @@ impl PresentContext {
         let (rb, w, h, fmt, row_pitch, tag, write_ppm) =
             (job.rb, job.w, job.h, job.fmt, job.row_pitch, job.tag, job.write_ppm);
         let draws = crate::com_proxy::gpu_draw_totals();
+        let app_state = crate::read_app_state();
         let elapsed_s = PROCESS_START.elapsed().as_secs_f64();
         type MapFn = unsafe extern "system" fn(*mut c_void, u32, *const [usize; 2], *mut *mut c_void) -> HRESULT;
         type UnmapFn = unsafe extern "system" fn(*mut c_void, u32, *const [usize; 2]);
@@ -1090,7 +1091,7 @@ impl PresentContext {
             "dx12xs_pc",
             "PresentContext::frame_stats",
             &format!(
-                "tick={tick} elapsed_s={elapsed_s:.1}s tag={tag} w={w} h={h} fmt={fmt} nonzero_px={nz} draws={draws:?} sc_hr={sc_hr:#010x} sample_rgba=[center={center:?} quarter={quarter:?}]{written_info}"
+                "tick={tick} elapsed_s={elapsed_s:.1}s tag={tag} app_state={app_state:?} w={w} h={h} fmt={fmt} nonzero_px={nz} draws={draws:?} sc_hr={sc_hr:#010x} sample_rgba=[center={center:?} quarter={quarter:?}]{written_info}"
             ),
         );
     }

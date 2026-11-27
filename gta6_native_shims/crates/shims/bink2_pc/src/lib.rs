@@ -53,39 +53,34 @@ pub extern "C" fn BinkOpenWithOptions(
     open_options: *const c_void,
     flags: u32,
 ) -> *mut BinkHandle {
-    let translated = if name.is_null() {
+    let from_memory = (flags & 0x400_0000) != 0;
+    let translated = if from_memory || name.is_null() {
         None
     } else {
         let raw = unsafe { CStr::from_ptr(name) }.to_string_lossy();
         translate_virtual_path_str(&raw).and_then(|s| CString::new(s).ok())
     };
     let effective_name = translated.as_ref().map_or(name, |c| c.as_ptr());
-    let name_log = if effective_name.is_null() {
+    let name_log = if from_memory {
+        String::from("<memory:KB2>")
+    } else if effective_name.is_null() {
         String::new()
     } else {
         unsafe { CStr::from_ptr(effective_name) }.to_string_lossy().into_owned()
     };
-    shim_common::boot_trace("bink2_pc", "BinkOpenWithOptions", &format!("file={name_log} flags={flags:#x}"));
 
     type FnTy = extern "C" fn(*const c_char, *const c_void, u32) -> *mut BinkHandle;
     if let Some(f) = unsafe { proc_or_none::<FnTy>(c"BinkOpenWithOptions") } {
+        shim_common::boot_trace("bink2_pc", "BinkOpenWithOptions", &format!("file={name_log} flags={flags:#x}"));
         return f(effective_name, open_options, flags);
     }
 
-    let bink = Box::new(BinkHandle {
-        width: 1920,
-        height: 1080,
-        frames: 1,
-        frame_num: 1,
-        last_frame_num: 1,
-        frame_rate: 60,
-        frame_rate_div: 1,
-        read_error: 0,
-        open_flags: flags,
-        paused: 0,
-        will_loop: 0,
-    });
-    Box::into_raw(bink)
+    shim_common::boot_trace(
+        "bink2_pc",
+        "BinkOpenWithOptions",
+        &format!("file={name_log} flags={flags:#x} -> returning NULL (skip movie cleanly)"),
+    );
+    std::ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
@@ -310,12 +305,14 @@ mod tests {
 
     #[test]
     fn fallback_lifecycle_works_without_bink2w64() {
+        assert!(!has_native_bink2w64());
         let h = BinkOpenWithOptions(c"G:\\movies\\intro.bk2".as_ptr(), std::ptr::null(), 0);
-        assert!(!h.is_null());
-        BinkPause(h, 1);
-        assert_eq!(unsafe { (*h).paused }, 1);
+        assert!(h.is_null());
+        let mem = [b'K', b'B', b'2', b'n', 0xFF, 0xFE];
+        let h_mem = BinkOpenWithOptions(mem.as_ptr().cast(), std::ptr::null(), 0x0410_4448);
+        assert!(h_mem.is_null());
+        assert_eq!(BinkPause(h, 1), 0);
         BinkSetWillLoop(h, 1);
-        assert_eq!(unsafe { (*h).will_loop }, 1);
         BinkClose(h);
     }
 }

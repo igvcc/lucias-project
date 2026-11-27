@@ -1049,17 +1049,54 @@ extern "system" fn xuser_duplicate(_: This, _: *const c_void, out: *mut *const c
     put(out, (&raw const OFFLINE_USER_HANDLE).cast())
 }
 extern "system" fn xuser_close(_: This, _: *const c_void) {}
-extern "system" fn xuser_add_async(_: This, _options: u32, block: *mut XAsyncBlock) -> HRESULT {
+extern "system" fn xuser_compare(_: This, u1: *const c_void, u2: *const c_void, out: *mut i32) -> HRESULT {
+    let cmp = if u1 == u2 {
+        0
+    } else if (u1 as usize) < (u2 as usize) {
+        -1
+    } else {
+        1
+    };
+    put(out, cmp)
+}
+extern "system" fn xuser_get_max_users(_: This, out: *mut u32) -> HRESULT {
+    put(out, 4)
+}
+extern "system" fn xuser_add_async(_: This, options: u32, block: *mut XAsyncBlock) -> HRESULT {
+    boot_trace(
+        "xgameruntime",
+        "XUser::AddAsync",
+        &format!("options={options:#x} block={block:?}"),
+    );
     finish_async_with(block, S_OK, (&raw const OFFLINE_USER_HANDLE as usize).to_le_bytes().to_vec())
 }
-extern "system" fn xuser_add_result(_: This, _block: *mut XAsyncBlock, out: *mut *const c_void) -> HRESULT {
+extern "system" fn xuser_add_by_id_with_ui_async(
+    this: This,
+    _user_id: u64,
+    options: u32,
+    block: *mut XAsyncBlock,
+) -> HRESULT {
+    xuser_add_async(this, options, block)
+}
+extern "system" fn xuser_add_result(_: This, block: *mut XAsyncBlock, out: *mut *const c_void) -> HRESULT {
+    boot_trace(
+        "xgameruntime",
+        "XUser::AddResult",
+        &format!("block={block:?} user={:?}", (&raw const OFFLINE_USER_HANDLE)),
+    );
     put(out, (&raw const OFFLINE_USER_HANDLE).cast())
 }
 extern "system" fn xuser_get_id(_: This, _: *const c_void, out: *mut u64) -> HRESULT {
     put(out, 0x0009_0000_0000_0001)
 }
+extern "system" fn xuser_find_by_id(_: This, _xuid: u64, out: *mut *const c_void) -> HRESULT {
+    put(out, (&raw const OFFLINE_USER_HANDLE).cast())
+}
 extern "system" fn xuser_get_local_id(_: This, _: *const c_void, out: *mut u64) -> HRESULT {
     put(out, 1)
+}
+extern "system" fn xuser_find_by_local_id(_: This, _local_id: u64, out: *mut *const c_void) -> HRESULT {
+    put(out, (&raw const OFFLINE_USER_HANDLE).cast())
 }
 extern "system" fn xuser_get_is_guest(_: This, _: *const c_void, out: *mut bool) -> HRESULT {
     put(out, false)
@@ -1160,18 +1197,21 @@ extern "system" fn xuser_dev_find(_: This, _id: *const c_void, out: *mut *const 
     put(out, (&raw const OFFLINE_USER_HANDLE).cast())
 }
 
-static XUSER_VTABLE: Vtable<35> = {
-    let mut t = fill_missing::<35>();
+static XUSER_VTABLE: Vtable<40> = {
+    let mut t = fill_missing::<40>();
     t[3] = xuser_duplicate as *const c_void;
     t[4] = xuser_close as *const c_void;
-    t[5] = xuser_add_async as *const c_void;
-    t[6] = xuser_add_result as *const c_void;
-    t[7] = xuser_get_id as *const c_void;
-    t[8] = xuser_get_local_id as *const c_void;
-    t[9] = xuser_get_is_guest as *const c_void;
-    t[10] = xuser_get_state as *const c_void;
-    t[11] = xuser_get_gamertag as *const c_void;
-    t[12] = xuser_check_privilege as *const c_void;
+    t[5] = xuser_compare as *const c_void;
+    t[6] = xuser_get_max_users as *const c_void;
+    t[7] = xuser_add_async as *const c_void;
+    t[8] = xuser_add_result as *const c_void;
+    t[9] = xuser_get_local_id as *const c_void;
+    t[10] = xuser_find_by_local_id as *const c_void;
+    t[11] = xuser_get_id as *const c_void;
+    t[12] = xuser_find_by_id as *const c_void;
+    t[13] = xuser_get_is_guest as *const c_void;
+    t[14] = xuser_get_state as *const c_void;
+    t[15] = xuser_get_gamertag as *const c_void;
     t[19] = xuser_get_age_group as *const c_void;
     t[20] = xuser_check_privilege as *const c_void;
     t[21] = xuser_resolve_priv_async as *const c_void;
@@ -1181,6 +1221,8 @@ static XUSER_VTABLE: Vtable<35> = {
     t[25] = xuser_token_result as *const c_void;
     t[33] = xuser_reg_change as *const c_void;
     t[34] = xuser_unreg_change as *const c_void;
+    t[37] = xuser_add_by_id_with_ui_async as *const c_void;
+    t[38] = xuser_add_result as *const c_void;
     Vtable(t)
 };
 static XUSER_GAMERTAG_VTABLE: Vtable<6> = {
@@ -1805,6 +1847,24 @@ extern "system" fn xstore_acquire_pkg_lic_async(_: This, _ctx: *const c_void, _i
 extern "system" fn xstore_acquire_pkg_lic_result(_: This, _blk: *mut XAsyncBlock, out: *mut *const u8) -> HRESULT {
     put(out, &raw const STORE_LIC)
 }
+extern "system" fn xstore_acquire_durables_lic_async(
+    _: This,
+    _ctx: *const c_void,
+    store_id: *const c_char,
+    block: *mut XAsyncBlock,
+) -> HRESULT {
+    let id_str = if store_id.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(store_id) }.to_string_lossy().into_owned()
+    };
+    boot_trace(
+        "xgameruntime",
+        "XStore::AcquireLicenseForDurablesAsync",
+        &format!("store_id={id_str} block={block:?}"),
+    );
+    finish_async_with(block, S_OK, (&raw const STORE_LIC as usize).to_le_bytes().to_vec())
+}
 extern "system" fn xstore_query_game_lic_async(_: This, _ctx: *const c_void, block: *mut XAsyncBlock) -> HRESULT {
     finish_async_with(block, S_OK, Vec::new())
 }
@@ -1819,6 +1879,30 @@ extern "system" fn xstore_query_game_lic_result(_: This, _blk: *mut XAsyncBlock,
 extern "system" fn xstore_offline_async(_: This, _ctx: *const c_void, block: *mut XAsyncBlock) -> HRESULT {
     finish_async_with(block, XSTORE_NETWORK_ERROR, Vec::new())
 }
+extern "system" fn xstore_reg_pkg_lic_lost(
+    _: This,
+    _license: *const c_void,
+    _q: *const c_void,
+    _ctx: *mut c_void,
+    _cb: *const c_void,
+    out_token: *mut u64,
+) -> HRESULT {
+    let tok = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    boot_trace(
+        "xgameruntime",
+        "XStore::RegisterPackageLicenseLost",
+        &format!("token={tok}"),
+    );
+    put(out_token, tok)
+}
+extern "system" fn xstore_unreg_pkg_lic_lost(
+    _: This,
+    _license: *const c_void,
+    _token: u64,
+    _wait: bool,
+) -> bool {
+    true
+}
 
 static XSTORE_VTABLE: Vtable<77> = {
     let mut t = fill_missing::<77>();
@@ -1829,6 +1913,10 @@ static XSTORE_VTABLE: Vtable<77> = {
     t[22] = xstore_is_license_valid as *const c_void;      // 0xb0
     t[28] = xstore_query_game_lic_async as *const c_void;  // 0xe0
     t[29] = xstore_query_game_lic_result as *const c_void; // 0xe8
+    t[68] = xstore_reg_pkg_lic_lost as *const c_void;      // 0x220
+    t[69] = xstore_unreg_pkg_lic_lost as *const c_void;    // 0x228
+    t[71] = xstore_acquire_durables_lic_async as *const c_void; // 0x238
+    t[72] = xstore_acquire_pkg_lic_result as *const c_void;     // 0x240
     t[75] = xstore_offline_async as *const c_void;         // 0x258
     Vtable(t)
 };
@@ -2213,5 +2301,111 @@ mod tests {
         assert!(tmp.join("xerror_report.log").exists());
         assert_eq!(UninitializeApiImpl(), S_OK);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn xuser_vtable_slots_5_through_14_match_gdk_table() {
+        let mut xuser_obj: *mut c_void = std::ptr::null_mut();
+        assert_eq!(QueryApiImpl(&PROVIDER_XUSER, &IID_XUSER, &mut xuser_obj), S_OK);
+        let vtbl = unsafe { *xuser_obj.cast::<*const *const c_void>() };
+
+        type CompareFn = unsafe extern "system" fn(*const c_void, *const c_void, *const c_void, *mut i32) -> HRESULT;
+        type MaxUsersFn = unsafe extern "system" fn(*const c_void, *mut u32) -> HRESULT;
+        type AddAsyncFn = unsafe extern "system" fn(*const c_void, u32, *mut XAsyncBlock) -> HRESULT;
+        type AddResultFn = unsafe extern "system" fn(*const c_void, *mut XAsyncBlock, *mut *const c_void) -> HRESULT;
+        type GetU64Fn = unsafe extern "system" fn(*const c_void, *const c_void, *mut u64) -> HRESULT;
+        type FindByU64Fn = unsafe extern "system" fn(*const c_void, u64, *mut *const c_void) -> HRESULT;
+        type GetBoolFn = unsafe extern "system" fn(*const c_void, *const c_void, *mut bool) -> HRESULT;
+        type GetU32Fn = unsafe extern "system" fn(*const c_void, *const c_void, *mut u32) -> HRESULT;
+
+        unsafe {
+            let mut blk = XAsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            let add_async: AddAsyncFn = std::mem::transmute(*vtbl.add(7));
+            assert_eq!(add_async(xuser_obj, 0, &mut blk), S_OK);
+            let mut user_handle: *const c_void = std::ptr::null();
+            let add_res: AddResultFn = std::mem::transmute(*vtbl.add(8));
+            assert_eq!(add_res(xuser_obj, &mut blk, &mut user_handle), S_OK);
+            assert!(!user_handle.is_null());
+
+            let compare: CompareFn = std::mem::transmute(*vtbl.add(5));
+            let mut cmp = -99i32;
+            assert_eq!(compare(xuser_obj, user_handle, user_handle, &mut cmp), S_OK);
+            assert_eq!(cmp, 0);
+
+            let max_users: MaxUsersFn = std::mem::transmute(*vtbl.add(6));
+            let mut max_u = 0u32;
+            assert_eq!(max_users(xuser_obj, &mut max_u), S_OK);
+            assert_eq!(max_u, 4);
+
+            let get_local: GetU64Fn = std::mem::transmute(*vtbl.add(9));
+            let mut local_id = 0u64;
+            assert_eq!(get_local(xuser_obj, user_handle, &mut local_id), S_OK);
+            assert_eq!(local_id, 1);
+
+            let find_local: FindByU64Fn = std::mem::transmute(*vtbl.add(10));
+            let mut by_local: *const c_void = std::ptr::null();
+            assert_eq!(find_local(xuser_obj, local_id, &mut by_local), S_OK);
+            assert_eq!(by_local, user_handle);
+
+            let get_id: GetU64Fn = std::mem::transmute(*vtbl.add(11));
+            let mut xuid = 0u64;
+            assert_eq!(get_id(xuser_obj, user_handle, &mut xuid), S_OK);
+            assert_eq!(xuid, 0x0009_0000_0000_0001);
+
+            let find_id: FindByU64Fn = std::mem::transmute(*vtbl.add(12));
+            let mut by_id: *const c_void = std::ptr::null();
+            assert_eq!(find_id(xuser_obj, xuid, &mut by_id), S_OK);
+            assert_eq!(by_id, user_handle);
+
+            let get_guest: GetBoolFn = std::mem::transmute(*vtbl.add(13));
+            let mut guest = true;
+            assert_eq!(get_guest(xuser_obj, user_handle, &mut guest), S_OK);
+            assert!(!guest);
+
+            let get_state: GetU32Fn = std::mem::transmute(*vtbl.add(14));
+            let mut state = 99u32;
+            assert_eq!(get_state(xuser_obj, user_handle, &mut state), S_OK);
+            assert_eq!(state, 0);
+        }
+    }
+
+    #[test]
+    fn xstore_slots_71_and_72_acquire_durables_license() {
+        let mut store_obj: *mut c_void = std::ptr::null_mut();
+        assert_eq!(QueryApiImpl(&PROVIDER_XSTORE, &IID_XSTORE_DURABLES, &mut store_obj), S_OK);
+        let vtbl = unsafe { *store_obj.cast::<*const *const c_void>() };
+        type AcquireDurAsyncFn = unsafe extern "system" fn(*const c_void, *const c_void, *const c_char, *mut XAsyncBlock) -> HRESULT;
+        type AcquireDurResFn = unsafe extern "system" fn(*const c_void, *mut XAsyncBlock, *mut *const u8) -> HRESULT;
+        let mut blk = XAsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        unsafe {
+            let acq_async: AcquireDurAsyncFn = std::mem::transmute(*vtbl.add(71));
+            assert_eq!(acq_async(store_obj, &raw const STORE_CTX as *const c_void, c"9NBLGGH5L9XT".as_ptr(), &mut blk), S_OK);
+            let mut lic: *const u8 = std::ptr::null();
+            let acq_res: AcquireDurResFn = std::mem::transmute(*vtbl.add(72));
+            assert_eq!(acq_res(store_obj, &mut blk, &mut lic), S_OK);
+            assert_eq!(lic, &raw const STORE_LIC);
+
+            type RegLostFn = unsafe extern "system" fn(*const c_void, *const c_void, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
+            type UnregLostFn = unsafe extern "system" fn(*const c_void, *const c_void, u64, bool) -> bool;
+            let reg_lost: RegLostFn = std::mem::transmute(*vtbl.add(68));
+            let unreg_lost: UnregLostFn = std::mem::transmute(*vtbl.add(69));
+            let mut tok = 0u64;
+            assert_eq!(
+                reg_lost(store_obj, lic.cast(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), &mut tok),
+                S_OK
+            );
+            assert_ne!(tok, 0);
+            assert!(unreg_lost(store_obj, lic.cast(), tok, true));
+        }
     }
 }

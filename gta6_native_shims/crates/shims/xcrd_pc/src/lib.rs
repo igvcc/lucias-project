@@ -12,6 +12,10 @@ use shim_common::{
     boot_trace_hr, read_wide_str, translate_virtual_path_str,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualAlloc, VirtualQuery,
+};
 
 /// Xbox Scarlett `IDStorageFactoryX` / `IDStorageFactoryX2` GUID.
 pub const IID_DSTORAGE_FACTORY_X: Guid = Guid::new(
@@ -100,6 +104,16 @@ enum QueuedCommand {
         status: usize, // *mut StatusArrayObject
         index: u32,
     },
+    Signal {
+        fence: usize, // *mut ID3D12Fence / FenceX
+        val: u64,
+    },
+}
+
+#[inline]
+unsafe fn com_slot<F: Copy>(obj: *mut c_void, slot: usize) -> F {
+    let vtbl = unsafe { *obj.cast::<*const *const c_void>() };
+    unsafe { std::mem::transmute_copy(&*vtbl.add(slot)) }
 }
 
 #[repr(C)]
@@ -506,14 +520,17 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
 
     // 2. Decompress if requested (ZLIB supported via zlib-rs).
     let payload: Vec<u8> = if (r.options & OPT_BCPACK_MASK) != 0 {
-        boot_trace(
-            "xcrd_pc",
-            "IDStorageQueueX::BCPACK_WARN",
-            &format!(
-                "options={:#x} src={} dst={}",
-                r.options, r.source_size, r.destination_size
-            ),
-        );
+        static BCPACK_LOGS: AtomicU32 = AtomicU32::new(0);
+        if BCPACK_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+            boot_trace(
+                "xcrd_pc",
+                "IDStorageQueueX::BCPACK_WARN",
+                &format!(
+                    "options={:#x} src={} dst={}",
+                    r.options, r.source_size, r.destination_size
+                ),
+            );
+        }
         raw
     } else if (r.options & OPT_ZLIB) != 0 {
         let mut out = vec![0u8; dst_len];
@@ -554,9 +571,85 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
             return E_INVALIDARG;
         }
     } else {
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination.cast::<u8>(), write_len);
+        return safe_copy_to_dst(r.destination.cast::<u8>(), &payload[..write_len]);
+    }
+    S_OK
+}
+
+fn safe_copy_to_dst(dst: *mut u8, src: &[u8]) -> HRESULT {
+    if dst.is_null() || src.is_empty() {
+        return S_OK;
+    }
+    static GUARD_LOGS: AtomicU32 = AtomicU32::new(0);
+    static COMMIT_LOGS: AtomicU32 = AtomicU32::new(0);
+    let writable_mask =
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    let mut offset = 0usize;
+    while offset < src.len() {
+        let cur = unsafe { dst.add(offset) };
+        let mut mbi = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+        let q = unsafe {
+            VirtualQuery(
+                cur.cast(),
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if q == 0 {
+            if GUARD_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                boot_trace(
+                    "xcrd_pc",
+                    "IDStorageQueueX::DST_GUARD",
+                    &format!("dst={dst:?} off={offset:#x} len={:#x} state=0", src.len()),
+                );
+            }
+            break;
         }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        let avail = region_end.saturating_sub(cur as usize);
+        if avail == 0 {
+            break;
+        }
+        let chunk = (src.len() - offset).min(avail);
+        if mbi.State == MEM_RESERVE {
+            let committed = unsafe { VirtualAlloc(cur.cast(), chunk, MEM_COMMIT, PAGE_READWRITE) };
+            if committed.is_null() {
+                if GUARD_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                    boot_trace(
+                        "xcrd_pc",
+                        "IDStorageQueueX::DST_GUARD",
+                        &format!(
+                            "dst={dst:?} off={offset:#x} len={:#x} state=MEM_RESERVE_FAIL",
+                            src.len()
+                        ),
+                    );
+                }
+                break;
+            }
+            if COMMIT_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                boot_trace(
+                    "xcrd_pc",
+                    "IDStorageQueueX::DST_LAZY_COMMIT",
+                    &format!("dst={cur:?} chunk={chunk:#x} off={offset:#x}"),
+                );
+            }
+        } else if mbi.State != MEM_COMMIT || (mbi.Protect & writable_mask) == 0 {
+            if GUARD_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                boot_trace(
+                    "xcrd_pc",
+                    "IDStorageQueueX::DST_GUARD",
+                    &format!(
+                        "dst={dst:?} off={offset:#x} len={:#x} state={:#x} prot={:#x}",
+                        src.len(),
+                        mbi.State,
+                        mbi.Protect
+                    ),
+                );
+            }
+            break;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().add(offset), cur, chunk) };
+        offset += chunk;
     }
     S_OK
 }
@@ -662,7 +755,32 @@ extern "system" fn queue_enqueue_status(
         });
 }
 
-extern "system" fn queue_enqueue_signal(_: *mut QueueObject, _fence: *mut c_void, _val: u64) {}
+extern "system" fn queue_enqueue_signal(this: *mut QueueObject, fence: *mut c_void, val: u64) {
+    if this.is_null() {
+        return;
+    }
+    if !fence.is_null() {
+        type AddRefFn = unsafe extern "system" fn(*mut c_void) -> u32;
+        unsafe { com_slot::<AddRefFn>(fence, 1)(fence) };
+    }
+    static ENQ_SIG_LOGS: AtomicU32 = AtomicU32::new(0);
+    let n = ENQ_SIG_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 {
+        boot_trace(
+            "xcrd_pc",
+            "IDStorageQueueX::EnqueueSignal",
+            &format!("#{n} q={this:?} fence={fence:?} val={val}"),
+        );
+    }
+    let q = unsafe { &*this };
+    q.pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(QueuedCommand::Signal {
+            fence: fence as usize,
+            val,
+        });
+}
 
 extern "system" fn queue_submit(this: *mut QueueObject) {
     if this.is_null() {
@@ -685,14 +803,19 @@ extern "system" fn queue_submit(this: *mut QueueObject) {
             &format!("#{submit_n} q={this:?} cmds={} ttdb={has_ttdb}", cmds.len()),
         );
     }
+    static TOTAL_READ_BYTES: AtomicU64 = AtomicU64::new(0);
     static REQ_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
     static TTDB_REQ_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
     static STATUS_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
     static TTDB_STATUS_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
+    static SIGNAL_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
+    let mut last_read: Option<DStorageRequest> = None;
     let mut err_slot = q.first_error.lock().unwrap_or_else(|e| e.into_inner());
     for cmd in cmds {
         match cmd {
             QueuedCommand::Read(req) => {
+                TOTAL_READ_BYTES.fetch_add(u64::from(req.destination_size), Ordering::Relaxed);
+                last_read = Some(req);
                 let is_ttdb = is_ttdb_request(&req);
                 let hr = execute_request(&req);
                 let rn = REQ_DONE_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -740,7 +863,36 @@ extern "system" fn queue_submit(this: *mut QueueObject) {
                 }
                 status_release(st_ptr);
             }
+            QueuedCommand::Signal { fence, val } => {
+                if fence != 0 {
+                    let fence_ptr = fence as *mut c_void;
+                    type SignalFn = unsafe extern "system" fn(*mut c_void, u64) -> HRESULT;
+                    type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+                    let hr = unsafe { com_slot::<SignalFn>(fence_ptr, 10)(fence_ptr, val) };
+                    let sign_n = SIGNAL_DONE_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sign_n <= 16 || hr < 0 {
+                        boot_trace_hr(
+                            "xcrd_pc",
+                            "IDStorageQueueX::SignalComplete",
+                            hr,
+                            &format!("#{sign_n} q={this:?} fence={fence_ptr:?} val={val}"),
+                        );
+                    }
+                    unsafe { com_slot::<ReleaseFn>(fence_ptr, 2)(fence_ptr) };
+                }
+            }
         }
+    }
+    if submit_n.is_multiple_of(500) {
+        let total_mib = TOTAL_READ_BYTES.load(Ordering::Relaxed) / (1024 * 1024);
+        let src_label = last_read
+            .as_ref()
+            .map_or_else(|| String::from("none"), request_source_label);
+        boot_trace(
+            "xcrd_pc",
+            "IDStorageQueueX::SubmitHeartbeat",
+            &format!("submit_n={submit_n} total_mib={total_mib} last_src={src_label}"),
+        );
     }
 }
 
@@ -869,5 +1021,75 @@ mod tests {
         status_release(status_ptr.cast());
         queue_release(queue_ptr.cast());
         file_release(file_ptr.cast());
+    }
+
+    #[test]
+    fn queue_enqueue_signal_invokes_fence_slot_10_on_submit() {
+        #[repr(C)]
+        struct MockFence {
+            vtable: *const *const c_void,
+            refs: AtomicU32,
+            signaled: AtomicU64,
+        }
+        extern "system" fn mock_add_ref(this: *mut MockFence) -> u32 {
+            unsafe { &*this }.refs.fetch_add(1, Ordering::SeqCst) + 1
+        }
+        extern "system" fn mock_release(this: *mut MockFence) -> u32 {
+            unsafe { &*this }.refs.fetch_sub(1, Ordering::SeqCst) - 1
+        }
+        extern "system" fn mock_signal(this: *mut MockFence, val: u64) -> HRESULT {
+            unsafe { &*this }.signaled.store(val, Ordering::SeqCst);
+            S_OK
+        }
+        let mut vtbl = [std::ptr::null::<c_void>(); 11];
+        vtbl[1] = mock_add_ref as *const c_void;
+        vtbl[2] = mock_release as *const c_void;
+        vtbl[10] = mock_signal as *const c_void;
+
+        let mut fence = MockFence {
+            vtable: vtbl.as_ptr(),
+            refs: AtomicU32::new(1),
+            signaled: AtomicU64::new(0),
+        };
+        let mut factory_ptr: *mut c_void = std::ptr::null_mut();
+        assert_eq!(DStorageGetFactory(&IID_DSTORAGE_FACTORY_X, &mut factory_ptr), S_OK);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 32,
+            priority: 0,
+            name: std::ptr::null(),
+            flags: 0,
+        };
+        let mut queue_ptr: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            factory_create_queue(factory_ptr.cast(), &desc, &IID_IUNKNOWN, &mut queue_ptr),
+            S_OK
+        );
+
+        queue_enqueue_signal(queue_ptr.cast(), (&raw mut fence).cast(), 0x1234_5678);
+        assert_eq!(fence.refs.load(Ordering::SeqCst), 2);
+        assert_eq!(fence.signaled.load(Ordering::SeqCst), 0);
+
+        queue_submit(queue_ptr.cast());
+        assert_eq!(fence.signaled.load(Ordering::SeqCst), 0x1234_5678);
+        assert_eq!(fence.refs.load(Ordering::SeqCst), 1);
+
+        queue_release(queue_ptr.cast());
+    }
+
+    #[test]
+    fn safe_copy_to_dst_commits_reserved_pages_and_guards_invalid_ptr() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 0x20000, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let data = vec![0xABu8; 0x1000];
+        assert_eq!(safe_copy_to_dst(base.cast(), &data), S_OK);
+        let written = unsafe { std::slice::from_raw_parts(base.cast::<u8>(), 0x1000) };
+        assert!(written.iter().all(|&b| b == 0xAB));
+        assert_eq!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 1);
+
+        // Null and unmapped pointers must not crash.
+        assert_eq!(safe_copy_to_dst(std::ptr::null_mut(), &data), S_OK);
+        assert_eq!(safe_copy_to_dst(0x1000usize as *mut u8, &data), S_OK);
     }
 }

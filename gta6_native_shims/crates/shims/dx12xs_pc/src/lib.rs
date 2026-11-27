@@ -23,7 +23,24 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 const X64_CONTEXT_RSP_OFFSET: usize = 0x98;
 const X64_CONTEXT_RIP_OFFSET: usize = 0xF8;
 const MAIN_EXE_IMAGE_SPAN: usize = 0x0B06_D000;
-const NONFATAL_DEV_ASSERT_RVAS: &[usize] = &[0x04DC_BC9D];
+const RVA_COUNT_CHUNKS_INT3: usize = 0x051D_251E;
+const RVA_COUNT_CHUNKS_RET: usize = 0x051D_250E;
+const NONFATAL_DEV_ASSERT_RVAS: &[usize] = &[
+    0x04DC_BC9D,
+    0x04FF_D859,
+    0x04FF_D85F,
+    0x04FF_D868,
+    0x04FF_D879,
+];
+const RVA_APP_STATE: usize = 0x098F_828C;
+const RVA_STATE_TBL: usize = 0x078A_C9C8;
+const RVA_STATE_PTR: usize = 0x078A_CB58;
+const RVA_STAGE_IDX: usize = 0x078A_CBA0;
+
+static DIAG_ADVANCE_BOOT: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("LUCIAS_DIAG_ADVANCE_BOOT_STAGE")
+        .is_ok_and(|v| v.trim() == "1")
+});
 
 #[repr(C)]
 struct ExceptionRecordRaw {
@@ -47,8 +64,27 @@ extern "system" {
     ) -> *mut c_void;
 }
 
+pub(crate) fn dev_assert_next_rva(rva: usize) -> Option<usize> {
+    if rva == RVA_COUNT_CHUNKS_INT3 {
+        Some(RVA_COUNT_CHUNKS_RET)
+    } else if NONFATAL_DEV_ASSERT_RVAS.contains(&rva) {
+        Some(rva + 1)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn is_allowlisted_dev_assert_rva(rva: usize) -> bool {
-    NONFATAL_DEV_ASSERT_RVAS.contains(&rva)
+    dev_assert_next_rva(rva).is_some()
+}
+
+pub(crate) fn read_app_state() -> Option<u32> {
+    let base = MAIN_EXE_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    safe_read_copy::<u32>(base.saturating_add(RVA_APP_STATE))
 }
 
 fn scan_stack_rvas(rsp: usize, base: usize) -> Vec<usize> {
@@ -81,6 +117,51 @@ fn scan_stack_rvas(rsp: usize, base: usize) -> Vec<usize> {
     rvas
 }
 
+fn format_rvas_csv(rvas: &[usize]) -> String {
+    rvas.iter().map(|r| format!("{r:#x}")).collect::<Vec<_>>().join(",")
+}
+
+fn query_committed_protect(addr: usize, len: usize) -> Option<u32> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if addr == 0 {
+        return None;
+    }
+    let mut mbi = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+    let q = unsafe { VirtualQuery(addr as *const c_void, &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) };
+    if q == 0 || mbi.State != MEM_COMMIT {
+        return None;
+    }
+    let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+    if addr.saturating_add(len) > region_end {
+        return None;
+    }
+    Some(mbi.Protect)
+}
+
+fn safe_read_copy<T: Copy>(addr: usize) -> Option<T> {
+    use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS};
+    let prot = query_committed_protect(addr, size_of::<T>())?;
+    if (prot & (PAGE_NOACCESS | PAGE_GUARD)) != 0 {
+        return None;
+    }
+    Some(unsafe { (addr as *const T).read_unaligned() })
+}
+
+fn safe_write_u32(addr: usize, val: u32) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    let Some(prot) = query_committed_protect(addr, size_of::<u32>()) else {
+        return false;
+    };
+    let writable_mask = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (prot & writable_mask) == 0 {
+        return false;
+    }
+    unsafe { (addr as *mut u32).write_unaligned(val) };
+    true
+}
+
 unsafe extern "system" fn dev_assert_veh(info: *mut ExceptionPointersRaw) -> i32 {
     if info.is_null() {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -99,26 +180,60 @@ unsafe extern "system" fn dev_assert_veh(info: *mut ExceptionPointersRaw) -> i32
         return EXCEPTION_CONTINUE_SEARCH;
     }
     let rva = addr - base;
-    if is_allowlisted_dev_assert_rva(rva) && unsafe { *(addr as *const u8) } == 0xCC {
+    let Some(next_rva) = dev_assert_next_rva(rva) else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    if unsafe { *(addr as *const u8) } == 0xCC {
+        let next_rip = base + next_rva;
         unsafe {
             ctx.add(X64_CONTEXT_RIP_OFFSET)
                 .cast::<u64>()
-                .write_unaligned((addr + 1) as u64);
+                .write_unaligned(next_rip as u64);
         }
         static SKIP_LOGS: AtomicU32 = AtomicU32::new(0);
+        static REDIRECT_LOGS: AtomicU32 = AtomicU32::new(0);
         let n = SKIP_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 4 || n == 16 || n == 64 || n == 128 || n == 256 || n.is_multiple_of(200) {
-            let mut msg = format!("#{n} rva={rva:#x} rip->{:#x}", addr + 1);
+        let log_redirect = rva == RVA_COUNT_CHUNKS_INT3
+            && REDIRECT_LOGS.fetch_add(1, Ordering::Relaxed) < 16;
+        if log_redirect || n <= 4 || n == 16 || n == 64 || n == 128 || n == 256 || n.is_multiple_of(200) {
+            let mut msg = format!("#{n} rva={rva:#x} rip->{next_rip:#x} (next_rva={next_rva:#x})");
             if matches!(n, 1 | 2 | 16 | 64 | 200) {
                 let rsp = unsafe { ctx.add(X64_CONTEXT_RSP_OFFSET).cast::<u64>().read_unaligned() } as usize;
-                let rvas = scan_stack_rvas(rsp, base);
-                let joined = rvas
-                    .iter()
-                    .map(|r| format!("{r:#x}"))
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let stack_csv = format_rvas_csv(&scan_stack_rvas(rsp, base));
+                let outer_csv = format_rvas_csv(&scan_stack_rvas(rsp.saturating_add(0x8000), base));
+                let app_state = safe_read_copy::<u32>(base.saturating_add(RVA_APP_STATE));
+                let stage_idx = safe_read_copy::<u32>(base.saturating_add(RVA_STAGE_IDX));
+                let state_ptr = safe_read_copy::<usize>(base.saturating_add(RVA_STATE_PTR)).unwrap_or(0);
+                let cur_id = if state_ptr != 0 {
+                    safe_read_copy::<u32>(state_ptr)
+                } else {
+                    None
+                };
+                let done_flag_addr = cur_id.and_then(|id| {
+                    if id < 5 {
+                        Some(base.saturating_add(RVA_STATE_TBL).saturating_add((id as usize) * 0x50 + 0x18))
+                    } else {
+                        None
+                    }
+                });
+                let done_flag = done_flag_addr.and_then(safe_read_copy::<u32>);
                 use std::fmt::Write;
-                let _ = write!(&mut msg, " stack_rvas=[{joined}]");
+                let _ = write!(
+                    &mut msg,
+                    " app_state={app_state:?} stage_idx={stage_idx:?} cur_id={cur_id:?} done_flag={done_flag:?} stack_rvas=[{stack_csv}] outer_rvas=[{outer_csv}]"
+                );
+                if *DIAG_ADVANCE_BOOT
+                    && n == 16
+                    && app_state == Some(3)
+                    && done_flag == Some(0)
+                    && done_flag_addr.is_some_and(|a| safe_write_u32(a, 1))
+                {
+                    boot_trace(
+                        "dx12xs_pc",
+                        "DevAssert::diag_advance_boot_stage",
+                        &format!("cur_id={} -> done_flag=1", cur_id.unwrap_or(u32::MAX)),
+                    );
+                }
             }
             boot_trace("dx12xs_pc", "DevAssert::skip", &msg);
         }
@@ -1153,7 +1268,18 @@ mod tests {
     #[test]
     fn allowlisted_dev_assert_rvas_match_strictly() {
         assert!(is_allowlisted_dev_assert_rva(0x04DC_BC9D));
+        assert!(is_allowlisted_dev_assert_rva(0x04FF_D879));
+        assert!(is_allowlisted_dev_assert_rva(0x051D_251E));
+        assert_eq!(dev_assert_next_rva(0x051D_251E), Some(0x051D_250E));
+        assert_eq!(dev_assert_next_rva(0x04DC_BC9D), Some(0x04DC_BC9E));
         assert!(!is_allowlisted_dev_assert_rva(0x0247_4606));
         assert!(!is_allowlisted_dev_assert_rva(0));
+        let mut cell = 0u32;
+        let ptr = (&raw mut cell) as usize;
+        assert_eq!(safe_read_copy::<u32>(ptr), Some(0));
+        assert!(safe_write_u32(ptr, 1));
+        assert_eq!(safe_read_copy::<u32>(ptr), Some(1));
+        assert_eq!(safe_read_copy::<u32>(0), None);
+        assert!(!safe_write_u32(0, 1));
     }
 }
