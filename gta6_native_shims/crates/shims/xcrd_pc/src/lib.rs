@@ -13,9 +13,11 @@ use shim_common::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE,
-    PAGE_EXECUTE_WRITECOPY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualAlloc, VirtualQuery,
+    MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READWRITE,
+    PAGE_WRITECOPY, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
 };
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// Xbox Scarlett `IDStorageFactoryX` / `IDStorageFactoryX2` GUID.
 pub const IID_DSTORAGE_FACTORY_X: Guid = Guid::new(
@@ -693,7 +695,25 @@ fn safe_copy_to_dst(dst: *mut u8, src: &[u8]) -> HRESULT {
         }
         let chunk = (src.len() - offset).min(avail);
         if mbi.State == MEM_RESERVE {
-            let committed = unsafe { VirtualAlloc(cur.cast(), chunk, MEM_COMMIT, PAGE_READWRITE) };
+            let mut committed = unsafe { VirtualAlloc(cur.cast(), chunk, MEM_COMMIT, PAGE_READWRITE) };
+            if committed.is_null() {
+                // `XMemVirtualAlloc` reserves 64 KiB placeholder regions (`MEM_RESERVE_PLACEHOLDER`),
+                // which reject `VirtualAlloc(MEM_COMMIT)` until split + replaced via `VirtualAlloc2`.
+                unsafe {
+                    VirtualFree(cur.cast(), chunk, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                }
+                committed = unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        cur.cast(),
+                        chunk,
+                        MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                        PAGE_READWRITE,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+            }
             if committed.is_null() {
                 if GUARD_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
                     boot_trace(

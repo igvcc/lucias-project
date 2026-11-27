@@ -6057,10 +6057,19 @@ extern "system" fn list_draw_indexed(this: *mut ListX, idx_cnt: u32, inst_cnt: u
     static DRAW_IDX_LOGS: AtomicU32 = AtomicU32::new(0);
     let log_n = DRAW_IDX_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
     if log_n <= 16 {
+        let l = unsafe { &*this };
+        let pso = l.last_pso.load(Ordering::Relaxed);
+        let rs = l.last_gfx_rs.load(Ordering::Relaxed);
+        let vb = l.last_vb_count.load(Ordering::Relaxed);
+        let rtv = l.last_rtv_count.load(Ordering::Relaxed);
+        let ops = {
+            let g = l.recent_ops.lock().unwrap_or_else(|e| e.into_inner());
+            format_ops_ring(&g)
+        };
         boot_trace(
             "dx12xs_pc",
             "ListX::DrawIndexed",
-            &format!("#{log_n} list={this:?} idx={idx_cnt} inst={inst_cnt} start_idx={start_idx} base_vtx={base_vtx} start_inst={start_inst}"),
+            &format!("#{log_n} list={this:?} idx={idx_cnt} inst={inst_cnt} start_idx={start_idx} base_vtx={base_vtx} start_inst={start_inst} pso={pso:#x} rs={rs:#x} vb={vb} rtv={rtv} ops=[{ops}]"),
         );
     }
     record_list_op(this, "DrawIndexed", u64::from(idx_cnt), u64::from(inst_cnt));
