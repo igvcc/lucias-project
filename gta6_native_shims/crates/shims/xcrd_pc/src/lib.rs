@@ -563,10 +563,42 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
         };
         let (res, rc) =
             zlib_rs::decompress_slice(&mut out, &raw, zlib_rs::InflateConfig::default());
-        if rc != zlib_rs::ReturnCode::Ok {
-            return INVALID_DATA;
+        if rc == zlib_rs::ReturnCode::Ok
+            || (rc == zlib_rs::ReturnCode::BufError && res.len() == dst_len)
+        {
+            res.to_vec()
+        } else {
+            let mut raw_out = out;
+            raw_out.fill(0);
+            let (raw_res, raw_rc) = zlib_rs::decompress_slice(
+                &mut raw_out,
+                &raw,
+                zlib_rs::InflateConfig { window_bits: -15 },
+            );
+            if raw_rc == zlib_rs::ReturnCode::Ok
+                || (raw_rc == zlib_rs::ReturnCode::BufError && raw_res.len() == dst_len)
+            {
+                raw_res.to_vec()
+            } else {
+                static ZLIB_FAIL_LOGS: AtomicU32 = AtomicU32::new(0);
+                if ZLIB_FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                    let head_hex: String = raw
+                        .iter()
+                        .take(16)
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    boot_trace(
+                        "xcrd_pc",
+                        "IDStorageQueueX::ZLIB_FAIL",
+                        &format!(
+                            "rc={rc:?} raw_rc={raw_rc:?} src={src_len} dst={dst_len} off={:#x} opts={:#x} inter={:#x} head={head_hex}",
+                            r.source_offset, r.options, r.intermediate_size
+                        ),
+                    );
+                }
+                return INVALID_DATA;
+            }
         }
-        res.to_vec()
     } else {
         raw
     };
@@ -575,7 +607,11 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
 
     // 3. Write destination (VA or physical pages via xmem_pc).
     if (r.options & OPT_PAGE_DESTINATION) != 0 {
-        let byte_off = (r.page_offset & 0xFFFF) as usize;
+        let byte_off = if r.page_offset < (1 << 28) {
+            r.page_offset as usize
+        } else {
+            (r.page_offset & 0xFFFF) as usize
+        };
         let page_count = (byte_off + write_len).div_ceil(PAGE_64K);
         let Some(write_phys) = resolve_write_phys() else {
             boot_trace(
@@ -595,6 +631,24 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
             )
         };
         if ok == 0 {
+            static PAGE_FAIL_LOGS: AtomicU32 = AtomicU32::new(0);
+            if PAGE_FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                let sample_n = page_count.min(4);
+                let sample_ids: Vec<String> = (0..sample_n)
+                    .map(|i| format!("{:#x}", unsafe { *r.destination.cast::<usize>().add(i) }))
+                    .collect();
+                boot_trace(
+                    "xcrd_pc",
+                    "IDStorageQueueX::PAGE_DEST_FAIL",
+                    &format!(
+                        "dst={:?} page_off={:#x} pages={page_count} len={write_len} opts={:#x} ids=[{}]",
+                        r.destination,
+                        r.page_offset,
+                        r.options,
+                        sample_ids.join(","),
+                    ),
+                );
+            }
             return E_INVALIDARG;
         }
     } else {
@@ -1139,5 +1193,30 @@ mod tests {
             name: std::ptr::null(),
         };
         assert_eq!(execute_request(&req), E_INVALIDARG);
+    }
+
+    #[test]
+    fn execute_request_zlib_prefix_truncation_succeeds() {
+        // zlib.compress(b'A' * 12288)
+        const ZLIB_12K_A: [u8; 36] = [
+            0x78, 0x9c, 0xed, 0xc1, 0x31, 0x01, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0x6c,
+            0xeb, 0x5f, 0xca, 0x1a, 0x1e, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xef, 0x06, 0x6c, 0xd9, 0x30, 0xb5,
+        ];
+        let mut dst = vec![0u8; 0x1000];
+        let req = DStorageRequest {
+            options: OPT_MEMORY_SOURCE | OPT_ZLIB,
+            destination: dst.as_mut_ptr().cast(),
+            page_offset: 0,
+            destination_size: 0x1000,
+            source: ZLIB_12K_A.as_ptr().cast(),
+            source_offset: 0,
+            source_size: ZLIB_12K_A.len() as u32,
+            intermediate_size: 0,
+            cancellation_tag: 0,
+            name: std::ptr::null(),
+        };
+        assert_eq!(execute_request(&req), S_OK);
+        assert!(dst.iter().all(|&b| b == b'A'));
     }
 }

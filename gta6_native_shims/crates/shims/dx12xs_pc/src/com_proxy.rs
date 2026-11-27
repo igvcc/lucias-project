@@ -6054,6 +6054,15 @@ extern "system" fn list_draw_indexed(this: *mut ListX, idx_cnt: u32, inst_cnt: u
     ) else {
         return;
     };
+    static DRAW_IDX_LOGS: AtomicU32 = AtomicU32::new(0);
+    let log_n = DRAW_IDX_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+    if log_n <= 16 {
+        boot_trace(
+            "dx12xs_pc",
+            "ListX::DrawIndexed",
+            &format!("#{log_n} list={this:?} idx={idx_cnt} inst={inst_cnt} start_idx={start_idx} base_vtx={base_vtx} start_inst={start_inst}"),
+        );
+    }
     record_list_op(this, "DrawIndexed", u64::from(idx_cnt), u64::from(inst_cnt));
     TOTAL_DRAW_INDEXED.fetch_add(1, Ordering::Relaxed);
     type FnTy = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);

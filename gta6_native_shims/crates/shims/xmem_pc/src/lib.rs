@@ -847,6 +847,10 @@ pub extern "system" fn PcXMemWritePhysicalPages(
     data: *const u8,
     len: usize,
 ) -> BOOL {
+    use std::sync::atomic::AtomicU32;
+    static FAIL_LOGS: AtomicU32 = AtomicU32::new(0);
+    static SUBPAGE_LOGS: AtomicU32 = AtomicU32::new(0);
+
     if len == 0 {
         return 1;
     }
@@ -859,26 +863,74 @@ pub extern "system" fn PcXMemWritePhysicalPages(
     let first_page_idx = offset / PAGE_64K;
     let last_page_idx = end.div_ceil(PAGE_64K);
     if last_page_idx > page_count {
+        if FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+            shim_common::boot_trace(
+                "xmem_pc",
+                "PcXMemWritePhysicalPages_FAIL",
+                &format!("reason=range last_page_idx={last_page_idx} > page_count={page_count} offset={offset:#x} len={len:#x}"),
+            );
+        }
         return 0;
     }
     let page_ids = unsafe { std::slice::from_raw_parts(pages.add(first_page_idx), last_page_idx - first_page_idx) };
 
+    enum WriteRun {
+        Skip { pages: usize },
+        Mapped { first: PageSlice, pages: usize, sub_off: usize },
+    }
+
     // Resolve runs of consecutive slices within each section under the lock.
-    let mut runs: Vec<(PageSlice, usize)> = Vec::new();
+    let mut runs: Vec<WriteRun> = Vec::new();
     {
         let phys = PHYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
         for &pid in page_ids {
-            let Some(slice) = phys.pages.get(&pid) else {
+            if pid == 0 {
+                match runs.last_mut() {
+                    Some(WriteRun::Skip { pages }) => *pages += 1,
+                    _ => runs.push(WriteRun::Skip { pages: 1 }),
+                }
+                continue;
+            }
+            let frame_off = pid & (FRAMES_PER_64K_PAGE - 1);
+            let base_pid = pid & !(FRAMES_PER_64K_PAGE - 1);
+            let Some(slice) = phys.pages.get(&base_pid) else {
+                if FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                    shim_common::boot_trace(
+                        "xmem_pc",
+                        "PcXMemWritePhysicalPages_FAIL",
+                        &format!("reason=lookup pid={pid:#x} base_pid={base_pid:#x} offset={offset:#x} len={len:#x} page_count={page_count}"),
+                    );
+                }
                 return 0;
             };
-            match runs.last_mut() {
-                Some((first, n))
-                    if Arc::ptr_eq(&first.section, &slice.section)
-                        && slice.index == first.index + *n =>
-                {
-                    *n += 1;
+            let sub_off = frame_off * 4096;
+            if sub_off != 0 && SUBPAGE_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+                shim_common::boot_trace(
+                    "xmem_pc",
+                    "PcXMemWritePhysicalPages_SUBPAGE",
+                    &format!("pid={pid:#x} base_pid={base_pid:#x} sub_off={sub_off:#x} offset={offset:#x} len={len:#x}"),
+                );
+            }
+            if sub_off == 0 {
+                match runs.last_mut() {
+                    Some(WriteRun::Mapped { first, pages, sub_off: 0 })
+                        if Arc::ptr_eq(&first.section, &slice.section)
+                            && slice.index == first.index + *pages =>
+                    {
+                        *pages += 1;
+                    }
+                    _ => runs.push(WriteRun::Mapped {
+                        first: slice.clone(),
+                        pages: 1,
+                        sub_off: 0,
+                    }),
                 }
-                _ => runs.push((slice.clone(), 1)),
+            } else {
+                runs.push(WriteRun::Mapped {
+                    first: slice.clone(),
+                    pages: 1,
+                    sub_off,
+                });
             }
         }
     }
@@ -886,39 +938,68 @@ pub extern "system" fn PcXMemWritePhysicalPages(
     let src = unsafe { std::slice::from_raw_parts(data, len) };
     let mut within = offset % PAGE_64K;
     let mut done = 0usize;
-    for (first, n) in runs {
-        let run_bytes = n * PAGE_64K;
-        let file_off = (first.index * PAGE_64K) as u64;
-        let view = unsafe {
-            MapViewOfFile(
-                first.section.handle,
-                FILE_MAP_WRITE,
-                (file_off >> 32) as u32,
-                file_off as u32,
-                run_bytes,
-            )
-        };
-        if view.Value.is_null() {
-            return 0;
+    for run in runs {
+        match run {
+            WriteRun::Skip { pages } => {
+                let skip_bytes = (pages * PAGE_64K - within).min(len - done);
+                done += skip_bytes;
+                within = 0;
+            }
+            WriteRun::Mapped { first, pages, sub_off } => {
+                let run_bytes = pages * PAGE_64K;
+                let file_off = (first.index * PAGE_64K) as u64;
+                let view = unsafe {
+                    MapViewOfFile(
+                        first.section.handle,
+                        FILE_MAP_WRITE,
+                        (file_off >> 32) as u32,
+                        file_off as u32,
+                        run_bytes,
+                    )
+                };
+                if view.Value.is_null() {
+                    if FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                        let err = std::io::Error::last_os_error();
+                        shim_common::boot_trace(
+                            "xmem_pc",
+                            "PcXMemWritePhysicalPages_FAIL",
+                            &format!("reason=MapViewOfFile file_off={file_off:#x} run_bytes={run_bytes:#x} err={err}"),
+                        );
+                    }
+                    return 0;
+                }
+                let ok = first
+                    .section
+                    .commit_range(first.index, view.Value as usize, run_bytes);
+                if !ok {
+                    unsafe { UnmapViewOfFile(view) };
+                    return 0;
+                }
+                let start_off = within + sub_off;
+                if start_off >= run_bytes {
+                    if FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                        shim_common::boot_trace(
+                            "xmem_pc",
+                            "PcXMemWritePhysicalPages_FAIL",
+                            &format!("reason=sub_off_oob within={within:#x} sub_off={sub_off:#x} run_bytes={run_bytes:#x}"),
+                        );
+                    }
+                    unsafe { UnmapViewOfFile(view) };
+                    return 0;
+                }
+                let copy_len = (run_bytes - start_off).min(len - done);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(done),
+                        view.Value.cast::<u8>().add(start_off),
+                        copy_len,
+                    );
+                    UnmapViewOfFile(view);
+                }
+                done += copy_len;
+                within = 0;
+            }
         }
-        let ok = first
-            .section
-            .commit_range(first.index, view.Value as usize, run_bytes);
-        if !ok {
-            unsafe { UnmapViewOfFile(view) };
-            return 0;
-        }
-        let copy_len = (run_bytes - within).min(len - done);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                src.as_ptr().add(done),
-                view.Value.cast::<u8>().add(within),
-                copy_len,
-            );
-            UnmapViewOfFile(view);
-        }
-        done += copy_len;
-        within = 0;
     }
     1
 }
@@ -1038,5 +1119,55 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(va, map_n, std::ptr::null()), va);
         unsafe { VirtualFree(va, 0, MEM_RELEASE) };
         assert_eq!(XMemFreePhysicalPages(SERIES_S_PAGES, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn write_physical_pages_handles_valid_and_zero_pages() {
+        let mut pages = [0usize; 2];
+        let mut count = 2usize;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()), 1);
+
+        let va = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE_64K,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!va.is_null());
+        assert_eq!(XMemMapPhysicalPages(va, 2, pages.as_ptr()), va);
+
+        // Contiguous write across both pages.
+        let payload = vec![0x3Cu8; PAGE_64K + 128];
+        assert_eq!(
+            PcXMemWritePhysicalPages(pages.as_ptr(), 2, 0, payload.as_ptr(), payload.len()),
+            1
+        );
+        unsafe {
+            assert_eq!(va.cast::<u8>().read(), 0x3C);
+            assert_eq!(va.cast::<u8>().add(PAGE_64K + 127).read(), 0x3C);
+        }
+
+        // Sparse write with pid == 0 in slot 0 and valid page in slot 1.
+        let sparse_pages = [0usize, pages[1]];
+        let sparse_payload = vec![0x5Au8; PAGE_64K + 64];
+        assert_eq!(
+            PcXMemWritePhysicalPages(
+                sparse_pages.as_ptr(),
+                2,
+                0,
+                sparse_payload.as_ptr(),
+                sparse_payload.len()
+            ),
+            1
+        );
+        unsafe {
+            assert_eq!(va.cast::<u8>().read(), 0x3C);
+            assert_eq!(va.cast::<u8>().add(PAGE_64K + 63).read(), 0x5A);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(va, 2, std::ptr::null()), va);
+        unsafe { VirtualFree(va, 0, MEM_RELEASE) };
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
