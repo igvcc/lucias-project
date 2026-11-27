@@ -4914,7 +4914,39 @@ extern "system" fn dev_create_sampler_x(
     dev_create_sampler(this, desc, cpu);
 }
 
-extern "system" fn dev_create_placed_view_x(
+fn dump_u32s(ptr: *const c_void, n: usize) -> String {
+    if ptr.is_null() || (ptr as usize) < 0x10000 {
+        return format!("{ptr:?}");
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr.cast::<u32>(), n) };
+    let hex: Vec<String> = slice.iter().map(|w| format!("{w:#x}")).collect();
+    format!("{ptr:?}[{}]", hex.join(","))
+}
+
+extern "system" fn dev_create_placed_view_70_x(
+    this: *mut DeviceX,
+    _res_desc: *mut c_void,
+    view_desc: *const c_void,
+    cpu: u64,
+) -> HRESULT {
+    let Some(pc_cpu) = translate_cpu_handle_for_ty(cpu, Some(0)) else {
+        return S_OK;
+    };
+    let d = unsafe { &*this };
+    let real = d.real_device;
+    let mut desc_scratch = ViewDesc40([0; 10]);
+    let pc_desc = patch_view_desc_remapped(std::ptr::null_mut(), view_desc, &mut desc_scratch);
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+        boot_trace("dx12xs_pc", "DeviceX::CreatePlacedView70X", &format!("cpu={cpu:#x}->{pc_cpu:#x} fmt={} dim={}", desc_scratch.0[0], desc_scratch.0[1]));
+    }
+    type FnTy = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, u64);
+    unsafe { com_slot::<FnTy>(real, 18)(real, std::ptr::null_mut(), pc_desc, pc_cpu) };
+    drain_info_queue(d.info_queue, "CreatePlacedView70X");
+    S_OK
+}
+
+extern "system" fn dev_create_placed_view_71_x(
     _this: *mut DeviceX,
     res: *mut c_void,
     desc: *const c_void,
@@ -4922,7 +4954,7 @@ extern "system" fn dev_create_placed_view_x(
 ) -> HRESULT {
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
-        boot_trace("dx12xs_pc", "DeviceX::CreatePlacedViewX", &format!("res={res:?} desc={desc:?} cpu={cpu:#x}"));
+        boot_trace("dx12xs_pc", "DeviceX::CreatePlacedView71X", &format!("arg1={} arg2={} cpu={cpu:#x}", dump_u32s(res, 8), dump_u32s(desc, 8)));
     }
     S_OK
 }
@@ -5030,8 +5062,8 @@ const DEVICE_VTABLE: Table<160> = {
     t[62] = dev_create_compute_pso_x as *const c_void;           // 0x1f0
     t[67] = dev_ext_notimpl as *const c_void;                    // 0x218
     t[69] = dev_noop_ok as *const c_void;                        // 0x228 SetDebugErrorFilter
-    t[70] = dev_create_placed_view_x as *const c_void;           // 0x230
-    t[71] = dev_create_placed_view_x as *const c_void;           // 0x238
+    t[70] = dev_create_placed_view_70_x as *const c_void;        // 0x230
+    t[71] = dev_create_placed_view_71_x as *const c_void;        // 0x238
     t[73] = dev_create_command_list_x as *const c_void;          // 0x248
     t[74] = dev_noop_ok as *const c_void;                        // 0x250 RegisterPagePoolX
     t[75] = dev_noop_ok as *const c_void;                        // 0x258 UnregisterPagePoolX
