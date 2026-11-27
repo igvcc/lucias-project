@@ -1996,7 +1996,7 @@ extern "system" fn dev_create_pipeline_state_stream(
             let fmt = sanitize_dsv_format(u32::from_le_bytes(pc_stream[off..off + 4].try_into().unwrap()));
             pc_stream[off..off + 4].copy_from_slice(&fmt.to_le_bytes());
             dsv_fmt_logged = fmt;
-        } else if kind == 10 {
+        } else if kind == 11 || kind == 21 {
             depth_en_logged = u32::from_le_bytes(pc_stream[dst_off + 4..dst_off + 8].try_into().unwrap());
             depth_fn_logged = u32::from_le_bytes(pc_stream[dst_off + 12..dst_off + 16].try_into().unwrap());
         } else if kind == 17 {
