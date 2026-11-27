@@ -749,21 +749,32 @@ fn safe_copy_to_dst(dst: *mut u8, src: &[u8]) -> HRESULT {
             let mut committed = unsafe { VirtualAlloc(cur.cast(), chunk, MEM_COMMIT, PAGE_READWRITE) };
             if committed.is_null() {
                 // `XMemVirtualAlloc` reserves 64 KiB placeholder regions (`MEM_RESERVE_PLACEHOLDER`),
-                // which reject `VirtualAlloc(MEM_COMMIT)` until split + replaced via `VirtualAlloc2`.
-                unsafe {
-                    VirtualFree(cur.cast(), chunk, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                // which require 64 KiB-aligned base & size for `VirtualFree(MEM_PRESERVE_PLACEHOLDER)`
+                // and `VirtualAlloc2(MEM_REPLACE_PLACEHOLDER)`.
+                let cur_addr = cur as usize;
+                let ph_base = cur_addr & !(PAGE_64K - 1);
+                let ph_end = (cur_addr + chunk).next_multiple_of(PAGE_64K).min(region_end);
+                let ph_size = ph_end.saturating_sub(ph_base);
+                if ph_size >= PAGE_64K {
+                    unsafe {
+                        VirtualFree(
+                            ph_base as *mut c_void,
+                            ph_size,
+                            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                        );
+                    }
+                    committed = unsafe {
+                        VirtualAlloc2(
+                            GetCurrentProcess(),
+                            ph_base as *const c_void,
+                            ph_size,
+                            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                            PAGE_READWRITE,
+                            std::ptr::null_mut(),
+                            0,
+                        )
+                    };
                 }
-                committed = unsafe {
-                    VirtualAlloc2(
-                        GetCurrentProcess(),
-                        cur.cast(),
-                        chunk,
-                        MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-                        PAGE_READWRITE,
-                        std::ptr::null_mut(),
-                        0,
-                    )
-                };
             }
             if committed.is_null() {
                 if GUARD_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
