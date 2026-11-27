@@ -1064,12 +1064,42 @@ fn refresh_live_uma_cbvs(d: &DeviceX) {
     let Some(pool) = guard.as_ref() else {
         return;
     };
+    let mut refreshed = 0usize;
     for cbv in &pool.live_cbvs {
         if is_readable_bytes(cbv.xb_va as *const c_void, cbv.copy_bytes) {
             unsafe {
                 std::ptr::copy_nonoverlapping(cbv.xb_va as *const u8, cbv.pc_ptr, cbv.copy_bytes);
             }
+            refreshed += 1;
         }
+    }
+    static S13_CBV_DUMP: AtomicBool = AtomicBool::new(false);
+    if !pool.live_cbvs.is_empty()
+        && crate::read_app_state() == Some(13)
+        && !S13_CBV_DUMP.swap(true, Ordering::Relaxed)
+    {
+        let tail: Vec<String> = pool
+            .live_cbvs
+            .iter()
+            .rev()
+            .take(4)
+            .map(|c| {
+                let mut words = [0u32; 4];
+                let n = (c.copy_bytes / 4).min(4);
+                for (i, w) in words.iter_mut().enumerate().take(n) {
+                    *w = unsafe { c.pc_ptr.cast::<u32>().add(i).read_unaligned() };
+                }
+                format!(
+                    "xb={:#x}->pc={:#x}(sz={})=[{:#x},{:#x},{:#x},{:#x}]",
+                    c.xb_va, c.pc_va, c.copy_bytes, words[0], words[1], words[2], words[3]
+                )
+            })
+            .collect();
+        boot_trace(
+            "dx12xs_pc",
+            "DeviceX::UmaCbvPool::s13_refresh",
+            &format!("total={} refreshed={refreshed} cursor={:#x} tail=[{}]", pool.live_cbvs.len(), pool.cursor, tail.join(" | ")),
+        );
     }
 }
 
@@ -2991,15 +3021,21 @@ extern "system" fn dev_create_cbv(this: *mut DeviceX, desc: *const c_void, cpu: 
     } else {
         unsafe { desc.cast::<CbvDescRaw>().read_unaligned() }
     };
-    if cbv_n <= 16 || pc_opt.is_none() {
+    static S13_CBV_LOGS: AtomicU32 = AtomicU32::new(0);
+    let s13_cbv_n = if crate::read_app_state() == Some(13) {
+        S13_CBV_LOGS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        999
+    };
+    if cbv_n <= 16 || s13_cbv_n <= 16 || pc_opt.is_none() {
         static CBV_MISS_LOGS: AtomicU32 = AtomicU32::new(0);
         let log_miss = pc_opt.is_none() && CBV_MISS_LOGS.fetch_add(1, Ordering::Relaxed) < 16;
-        if cbv_n <= 16 || log_miss {
+        if cbv_n <= 16 || s13_cbv_n <= 16 || log_miss {
             boot_trace(
                 "dx12xs_pc",
                 "DeviceX::CreateConstantBufferView",
                 &format!(
-                    "#{cbv_n} xb_cpu={cpu:#x} pc_cpu={:?} loc={:#x} size={}",
+                    "#{cbv_n}(s13:{s13_cbv_n}) xb_cpu={cpu:#x} pc_cpu={:?} loc={:#x} size={}",
                     pc_opt.map(|v| format!("{v:#x}")),
                     raw_cbv.buffer_location,
                     raw_cbv.size_in_bytes
@@ -3370,8 +3406,10 @@ extern "system" fn dev_copy_descriptors_simple(
         return;
     };
     static COPY_SIMPLE_LOGS: AtomicU32 = AtomicU32::new(0);
-    if heap_ty == 0 && COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
-        boot_trace("dx12xs_pc", "DeviceX::CopyDescriptorsSimple(ty0)", &format!("n={n} ty={heap_ty} dst={dst:#x}->{pc_dst:#x} src={src:#x}->{pc_src:#x}"));
+    static S13_COPY_SIMPLE_LOGS: AtomicU32 = AtomicU32::new(0);
+    let s13_copy = heap_ty == 0 && crate::read_app_state() == Some(13) && S13_COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 16;
+    if (heap_ty == 0 && COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 8) || s13_copy {
+        boot_trace("dx12xs_pc", "DeviceX::CopyDescriptorsSimple(ty0)", &format!("n={n} ty={heap_ty} s13={s13_copy} dst={dst:#x}->{pc_dst:#x} src={src:#x}->{pc_src:#x}"));
     }
     let real = unsafe { &*this }.real_device;
     type FnTy = unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32);
