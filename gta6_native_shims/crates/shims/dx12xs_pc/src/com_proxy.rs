@@ -491,6 +491,21 @@ fn find_registered_gpu_buffer(va: u64, size: u32) -> bool {
 
 static UNTRANSLATED_DESC_WARNS: AtomicU32 = AtomicU32::new(0);
 
+fn fold_desc_idx(idx: u64, pc_count: u32) -> u64 {
+    if pc_count == 0 {
+        return idx;
+    }
+    let cap = u64::from(pc_count);
+    if idx < cap {
+        idx
+    } else {
+        // Fold Xbox indices >= 1,000,000 into [cap/2 .. cap-1] instead of clamping
+        // all overflowed tables onto slot (cap - 1), preserving distinct contiguous tables.
+        let base = cap / 2;
+        (base + (idx - cap)).min(cap - 1)
+    }
+}
+
 fn translate_cpu_handle_for_ty(xb_handle: u64, expected_ty: Option<u32>) -> Option<u64> {
     let ranges = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
     for r in ranges.iter().rev() {
@@ -499,23 +514,8 @@ fn translate_cpu_handle_for_ty(xb_handle: u64, expected_ty: Option<u32>) -> Opti
         }
         if xb_handle >= r.xb_start && xb_handle < r.xb_end && r.xb_stride > 0 {
             let idx = (xb_handle - r.xb_start) / u64::from(r.xb_stride);
-            let clamped = if r.pc_count > 0 {
-                if idx >= u64::from(r.pc_count) {
-                    static CLAMP_LOGS: AtomicU32 = AtomicU32::new(0);
-                    let cn = CLAMP_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-                    if cn <= 16 || cn.is_power_of_two() {
-                        boot_trace(
-                            "dx12xs_pc",
-                            "DescriptorHandle::gpu_idx_clamped",
-                            &format!("#{cn} idx={idx} pc_count={} xb={xb_handle:#x}", r.pc_count),
-                        );
-                    }
-                }
-                idx.min(u64::from(r.pc_count - 1))
-            } else {
-                idx
-            };
-            return Some(r.pc_start + clamped * u64::from(r.pc_stride));
+            let mapped = fold_desc_idx(idx, r.pc_count);
+            return Some(r.pc_start + mapped * u64::from(r.pc_stride));
         }
     }
     let n = UNTRANSLATED_DESC_WARNS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -551,23 +551,8 @@ fn translate_gpu_handle_with_idx(xb_handle: u64) -> Option<(u64, u32)> {
         }
         if xb_handle >= r.xb_start && xb_handle < r.xb_end && r.xb_stride > 0 {
             let idx = (xb_handle - r.xb_start) / u64::from(r.xb_stride);
-            let clamped = if r.pc_count > 0 {
-                if idx >= u64::from(r.pc_count) {
-                    static CLAMP_LOGS: AtomicU32 = AtomicU32::new(0);
-                    let cn = CLAMP_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-                    if cn <= 16 || cn.is_power_of_two() {
-                        boot_trace(
-                            "dx12xs_pc",
-                            "DescriptorHandle::gpu_idx_clamped",
-                            &format!("#{cn} idx={idx} pc_count={} xb={xb_handle:#x}", r.pc_count),
-                        );
-                    }
-                }
-                idx.min(u64::from(r.pc_count - 1))
-            } else {
-                idx
-            };
-            return Some((r.pc_gpu_start + clamped * u64::from(r.pc_stride), clamped as u32));
+            let mapped = fold_desc_idx(idx, r.pc_count);
+            return Some((r.pc_gpu_start + mapped * u64::from(r.pc_stride), mapped as u32));
         }
     }
     None
