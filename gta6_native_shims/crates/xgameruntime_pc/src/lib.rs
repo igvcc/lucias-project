@@ -1087,21 +1087,27 @@ extern "system" fn xuser_add_result(_: This, block: *mut XAsyncBlock, out: *mut 
     put(out, (&raw const OFFLINE_USER_HANDLE).cast())
 }
 extern "system" fn xuser_get_id(_: This, _: *const c_void, out: *mut u64) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::GetId", "xuid=0x9000000000001");
     put(out, 0x0009_0000_0000_0001)
 }
 extern "system" fn xuser_find_by_id(_: This, _xuid: u64, out: *mut *const c_void) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::FindUserById", &format!("xuid={_xuid:#x}"));
     put(out, (&raw const OFFLINE_USER_HANDLE).cast())
 }
 extern "system" fn xuser_get_local_id(_: This, _: *const c_void, out: *mut u64) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::GetLocalId", "local_id=1");
     put(out, 1)
 }
 extern "system" fn xuser_find_by_local_id(_: This, _local_id: u64, out: *mut *const c_void) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::FindUserByLocalId", &format!("local_id={_local_id}"));
     put(out, (&raw const OFFLINE_USER_HANDLE).cast())
 }
 extern "system" fn xuser_get_is_guest(_: This, _: *const c_void, out: *mut bool) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::GetIsGuest", "is_guest=false");
     put(out, false)
 }
 extern "system" fn xuser_get_state(_: This, _: *const c_void, out: *mut u32) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::GetState", "state=0(SignedIn)");
     put(out, 0) // SignedIn
 }
 extern "system" fn xuser_get_gamertag(
@@ -1113,9 +1119,11 @@ extern "system" fn xuser_get_gamertag(
     used: *mut usize,
 ) -> HRESULT {
     let text = if component == 2 { "" } else { "Player" };
+    boot_trace("xgameruntime", "XUser::GetGamertag", &format!("comp={component} text={text}"));
     put_string(text, sz, buf, used)
 }
 extern "system" fn xuser_get_age_group(_: This, _: *const c_void, out: *mut u32) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::GetAgeGroup", "age=3(Adult)");
     put(out, 3) // Adult
 }
 extern "system" fn xuser_check_privilege(
@@ -1126,6 +1134,7 @@ extern "system" fn xuser_check_privilege(
     has: *mut bool,
     reason: *mut u32,
 ) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::CheckPrivilege", &format!("priv={_priv_id}"));
     if !reason.is_null() {
         unsafe { reason.write(0) };
     }
@@ -1384,7 +1393,8 @@ extern "system" fn gamesave_init_provider(
     } else {
         sanitize_name(&cstr_to_string(scid))
     };
-    let root = ensure_data_dirs().join("saves").join(scid_str);
+    let root = ensure_data_dirs().join("saves").join(scid_str.clone());
+    boot_trace("xgameruntime", "XGameSave::InitializeProvider", &format!("scid={scid_str} root={}", root.display()));
     let _ = fs::create_dir_all(&root);
     let prov = Box::new(GameSaveProvider { root });
     unsafe { out.write(Box::into_raw(prov)) };
@@ -1429,6 +1439,7 @@ extern "system" fn gamesave_close_provider(_: This, prov: *mut GameSaveProvider)
     }
 }
 extern "system" fn gamesave_get_quota(_: This, prov: *mut GameSaveProvider, remaining: *mut i64) -> HRESULT {
+    boot_trace("xgameruntime", "XGameSave::GetRemainingQuota", "sync");
     let used = unsafe { prov.as_ref() }.map_or(0, |p| dir_used_bytes(&p.root));
     put(remaining, LOCAL_QUOTA_BYTES.saturating_sub(used) as i64)
 }
@@ -1437,6 +1448,7 @@ extern "system" fn gamesave_get_quota_async(
     prov: *mut GameSaveProvider,
     block: *mut XAsyncBlock,
 ) -> HRESULT {
+    boot_trace("xgameruntime", "XGameSave::GetRemainingQuotaAsync", &format!("block={block:?}"));
     let used = unsafe { prov.as_ref() }.map_or(0, |p| dir_used_bytes(&p.root));
     let rem = LOCAL_QUOTA_BYTES.saturating_sub(used) as i64;
     finish_async_with(block, S_OK, rem.to_le_bytes().to_vec())
@@ -1465,6 +1477,7 @@ extern "system" fn gamesave_enum_containers(
     _ctx: *mut c_void,
     _cb: *const c_void,
 ) -> HRESULT {
+    boot_trace("xgameruntime", "XGameSave::EnumContainers", &format!("prefix={}", cstr_to_string(_prefix)));
     S_OK
 }
 extern "system" fn gamesave_create_container(
@@ -1477,6 +1490,7 @@ extern "system" fn gamesave_create_container(
         return E_INVALIDARG;
     }
     let cname = sanitize_name(&cstr_to_string(name));
+    boot_trace("xgameruntime", "XGameSave::CreateContainer", &format!("name={cname}"));
     let dir = unsafe { &*prov }.root.join(if cname.is_empty() { "default" } else { &cname });
     let _ = fs::create_dir_all(&dir);
     let cont = Box::new(GameSaveContainer { dir });
@@ -1494,6 +1508,7 @@ extern "system" fn gamesave_enum_blobs(
     _ctx: *mut c_void,
     _cb: *const c_void,
 ) -> HRESULT {
+    boot_trace("xgameruntime", "XGameSave::EnumBlobs", "called");
     S_OK
 }
 extern "system" fn gamesave_read_blob_async(
@@ -1510,6 +1525,7 @@ extern "system" fn gamesave_read_blob_async(
         return finish_async_with(block, BLOB_NOT_FOUND, Vec::new());
     }
     let name = sanitize_name(&cstr_to_string(unsafe { *blob_names }));
+    boot_trace("xgameruntime", "XGameSave::ReadBlobAsync", &format!("name={name} num={num_blobs}"));
     match fs::read(c.dir.join(name)) {
         Ok(bytes) => finish_async_with(block, S_OK, bytes),
         Err(_) => finish_async_with(block, BLOB_NOT_FOUND, Vec::new()),
@@ -1571,6 +1587,7 @@ extern "system" fn gamesave_submit_update(_: This, upd: *mut GameSaveUpdate) -> 
     let Some(u) = (unsafe { upd.as_mut() }) else {
         return E_INVALIDARG;
     };
+    boot_trace("xgameruntime", "XGameSave::SubmitUpdate", &format!("writes={} deletes={}", u.writes.len(), u.deletes.len()));
     let _ = fs::create_dir_all(&u.container_dir);
     for (name, bytes) in u.writes.drain(..) {
         let _ = fs::write(u.container_dir.join(name), bytes);
