@@ -1061,6 +1061,9 @@ impl PresentContext {
         let draws = crate::com_proxy::gpu_draw_totals();
         let app_state = crate::read_app_state();
         let elapsed_s = PROCESS_START.elapsed().as_secs_f64();
+        if app_state == Some(3) && elapsed_s >= 75.0 {
+            crate::maybe_diag_advance_boot_stage();
+        }
         type MapFn = unsafe extern "system" fn(*mut c_void, u32, *const [usize; 2], *mut *mut c_void) -> HRESULT;
         type UnmapFn = unsafe extern "system" fn(*mut c_void, u32, *const [usize; 2]);
         let total = row_pitch as usize * h as usize;

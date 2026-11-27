@@ -87,6 +87,33 @@ pub(crate) fn read_app_state() -> Option<u32> {
     safe_read_copy::<u32>(base.saturating_add(RVA_APP_STATE))
 }
 
+pub(crate) fn maybe_diag_advance_boot_stage() {
+    if !*DIAG_ADVANCE_BOOT {
+        return;
+    }
+    let base = MAIN_EXE_BASE.load(Ordering::Relaxed);
+    if base == 0 || read_app_state() != Some(3) {
+        return;
+    }
+    let state_ptr = safe_read_copy::<usize>(base.saturating_add(RVA_STATE_PTR)).unwrap_or(0);
+    let Some(cur_id) = (state_ptr != 0).then(|| safe_read_copy::<u32>(state_ptr)).flatten() else {
+        return;
+    };
+    if cur_id >= 5 {
+        return;
+    }
+    let done_flag_addr = base
+        .saturating_add(RVA_STATE_TBL)
+        .saturating_add((cur_id as usize) * 0x50 + 0x18);
+    if safe_read_copy::<u32>(done_flag_addr) == Some(0) && safe_write_u32(done_flag_addr, 1) {
+        boot_trace(
+            "dx12xs_pc",
+            "PresentContext::diag_advance_boot_stage",
+            &format!("cur_id={cur_id} -> done_flag=1"),
+        );
+    }
+}
+
 fn scan_stack_rvas(rsp: usize, base: usize) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if rsp == 0 || base == 0 {
