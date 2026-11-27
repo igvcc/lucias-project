@@ -1797,10 +1797,8 @@ fn get_or_create_compute_rs_upgrade(d: &DeviceX, orig_rs: *mut c_void) -> *mut c
         }
         let desc_flags = if sanitized.version >= 2 { 0x2 } else { 0 };
         params.push([4, 0, 252, 1, desc_flags, 0, 0, 0]); // UAV u252 space1
-        params.push([3, 0, 252, 1, desc_flags, 0, 0, 0]); // SRV t252 space1
         params.push([3, 0, 254, 1, desc_flags, 0, 0, 0]); // SRV t254 space1
         params.push([2, 0, 3, 1, desc_flags, 0, 0, 0]); // CBV b3 space1
-        params.push([2, 0, 29, 1, desc_flags, 0, 0, 0]); // CBV b29 space1
         sanitized.desc.num_parameters = params.len() as u32;
         sanitized.desc.parameters = params.as_ptr().cast();
         let mut ser_blob: *mut c_void = std::ptr::null_mut();
@@ -2171,9 +2169,17 @@ extern "system" fn dev_create_pipeline_state_stream(
             let fmt = sanitize_dsv_format(u32::from_le_bytes(pc_stream[off..off + 4].try_into().unwrap()));
             pc_stream[off..off + 4].copy_from_slice(&fmt.to_le_bytes());
             dsv_fmt_logged = fmt;
+        } else if kind == 8 {
+            // BLEND: [u32 kind, BOOL alpha_to_cov, BOOL indep_blend, RT0: BlendEnable(+12), ..., WriteMask(+48)]
+            if sz >= 52 {
+                let b_en = u32::from_le_bytes(pc_stream[dst_off + 12..dst_off + 16].try_into().unwrap());
+                let src_b = u32::from_le_bytes(pc_stream[dst_off + 20..dst_off + 24].try_into().unwrap());
+                let dst_b = u32::from_le_bytes(pc_stream[dst_off + 24..dst_off + 28].try_into().unwrap());
+                let wmask = pc_stream[dst_off + 48];
+                depth_fn_logged = (b_en & 1) | ((src_b & 0xFF) << 8) | ((dst_b & 0xFF) << 16) | (u32::from(wmask) << 24);
+            }
         } else if kind == 11 || kind == 21 {
             depth_en_logged = u32::from_le_bytes(pc_stream[dst_off + 4..dst_off + 8].try_into().unwrap());
-            depth_fn_logged = u32::from_le_bytes(pc_stream[dst_off + 12..dst_off + 16].try_into().unwrap());
         } else if kind == 17 {
             sample_cnt_logged = u32::from_le_bytes(pc_stream[dst_off + 4..dst_off + 8].try_into().unwrap());
         } else if kind == 19 {
