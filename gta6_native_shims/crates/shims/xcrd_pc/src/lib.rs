@@ -497,25 +497,41 @@ fn try_alloc_zeroed(len: usize) -> Option<Vec<u8>> {
     Some(v)
 }
 
-fn decode_bcpack(mode: u8, comp: &[u8], dst_len: usize) -> Option<Vec<u8>> {
-    let codec = mode << 2;
+fn decode_bcpack_exact(codec: u8, comp: &[u8], out_len: usize) -> Option<Vec<u8>> {
     if codec == sixng_core::bcpack::CODEC_BC1 {
-        if dst_len == 0 || !dst_len.is_multiple_of(8) {
+        if out_len == 0 || !out_len.is_multiple_of(8) {
             return None;
         }
         use bcpack::bc1::{QuadTable, Window};
         static TABLES: std::sync::OnceLock<(Window, QuadTable)> = std::sync::OnceLock::new();
         let (w, q) = TABLES.get_or_init(|| (Window::default_table(), QuadTable::default_table()));
-        return bcpack::bc1::decode(comp, dst_len / 8, w, q)
+        return bcpack::bc1::decode(comp, out_len / 8, w, q)
             .ok()
-            .filter(|o| o.blocks.len() == dst_len)
+            .filter(|o| o.blocks.len() == out_len)
             .map(|o| o.blocks);
     }
     if sixng_core::bcpack::supported(codec) {
-        return sixng_core::bcpack::decode(codec, comp, dst_len)
+        return sixng_core::bcpack::decode(codec, comp, out_len)
             .ok()
-            .filter(|d| d.data.len() == dst_len)
+            .filter(|d| d.data.len() == out_len)
             .map(|d| d.data);
+    }
+    None
+}
+
+fn decode_bcpack(mode: u8, comp: &[u8], dst_len: usize) -> Option<Vec<u8>> {
+    let codec = mode << 2;
+    if let Some(out) = decode_bcpack_exact(codec, comp, dst_len) {
+        return Some(out);
+    }
+    if !comp.is_empty() && dst_len > 0 {
+        let aligned_out = comp.len().div_ceil(PAGE_64K) * PAGE_64K;
+        if aligned_out > dst_len {
+            if let Some(mut out) = decode_bcpack_exact(codec, comp, aligned_out) {
+                out.truncate(dst_len);
+                return Some(out);
+            }
+        }
     }
     None
 }
