@@ -6173,6 +6173,12 @@ extern "system" fn list_ia_set_topology(this: *mut ListX, topo: u32) {
 }
 extern "system" fn list_rs_set_viewports(this: *mut ListX, count: u32, vps: *const c_void) {
     let Some(real) = list_open_real(this) else { return; };
+    if count > 0 && !vps.is_null() {
+        let f = unsafe { vps.cast::<[f32; 6]>().read_unaligned() };
+        record_list_op(this, "SetVP", ((f[2] as u64) << 32) | (f[3] as u32 as u64), u64::from(count));
+    } else {
+        record_list_op(this, "SetVP", 0, u64::from(count));
+    }
     static VP_LOGS: AtomicU32 = AtomicU32::new(0);
     if VP_LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
         let vp0 = if count > 0 && !vps.is_null() {
@@ -6191,6 +6197,12 @@ extern "system" fn list_rs_set_viewports(this: *mut ListX, count: u32, vps: *con
 }
 extern "system" fn list_rs_set_scissors(this: *mut ListX, count: u32, rects: *const c_void) {
     let Some(real) = list_open_real(this) else { return; };
+    if count > 0 && !rects.is_null() {
+        let r = unsafe { rects.cast::<[i32; 4]>().read_unaligned() };
+        record_list_op(this, "SetScissor", ((r[2] as u64) << 32) | (r[3] as u32 as u64), ((r[0] as u64) << 32) | (r[1] as u32 as u64));
+    } else {
+        record_list_op(this, "SetScissor", 0, u64::from(count));
+    }
     static SC_LOGS: AtomicU32 = AtomicU32::new(0);
     if SC_LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
         let r0 = if count > 0 && !rects.is_null() {

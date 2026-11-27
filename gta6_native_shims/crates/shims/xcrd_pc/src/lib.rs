@@ -582,23 +582,74 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
             {
                 raw_res.to_vec()
             } else {
-                static ZLIB_FAIL_LOGS: AtomicU32 = AtomicU32::new(0);
-                if ZLIB_FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
-                    let head_hex: String = raw
-                        .iter()
-                        .take(16)
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    boot_trace(
-                        "xcrd_pc",
-                        "IDStorageQueueX::ZLIB_FAIL",
-                        &format!(
-                            "rc={rc:?} raw_rc={raw_rc:?} src={src_len} dst={dst_len} off={:#x} opts={:#x} inter={:#x} head={head_hex}",
-                            r.source_offset, r.options, r.intermediate_size
-                        ),
-                    );
+                // `fiDeviceDirectStorage` (`0x4ffd6da`) can add a sub-chunk delta (e.g. `0x8c000`)
+                // to `source_offset` when a compressed chunk is read mid-chunk.
+                let mut recovered: Option<Vec<u8>> = None;
+                if (r.options & OPT_MEMORY_SOURCE) == 0 && r.source_offset >= 0x8_c000 {
+                    let file_obj = unsafe { &*r.source.cast::<FileObject>() };
+                    if let Some(file) = file_obj.file.as_ref() {
+                        let shifted_off = r.source_offset - 0x8_c000;
+                        if let Some(mut alt_raw) = try_alloc_zeroed(src_len) {
+                            let mut done = 0usize;
+                            let mut read_ok = true;
+                            while done < src_len {
+                                match file.seek_read(&mut alt_raw[done..], shifted_off + done as u64) {
+                                    Ok(0) | Err(_) => {
+                                        read_ok = false;
+                                        break;
+                                    }
+                                    Ok(n) => done += n,
+                                }
+                            }
+                            if read_ok && alt_raw.first() == Some(&0x78) {
+                                raw_out.fill(0);
+                                let (alt_res, alt_rc) = zlib_rs::decompress_slice(
+                                    &mut raw_out,
+                                    &alt_raw,
+                                    zlib_rs::InflateConfig::default(),
+                                );
+                                if alt_rc == zlib_rs::ReturnCode::Ok
+                                    || (alt_rc == zlib_rs::ReturnCode::BufError
+                                        && alt_res.len() == dst_len)
+                                {
+                                    static SHIFT_LOGS: AtomicU32 = AtomicU32::new(0);
+                                    if SHIFT_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+                                        boot_trace(
+                                            "xcrd_pc",
+                                            "IDStorageQueueX::ZLIB_SHIFT_RECOVERY",
+                                            &format!(
+                                                "off={:#x}->{shifted_off:#x} src={src_len} dst={dst_len}",
+                                                r.source_offset
+                                            ),
+                                        );
+                                    }
+                                    recovered = Some(alt_res.to_vec());
+                                }
+                            }
+                        }
+                    }
                 }
-                return INVALID_DATA;
+                if let Some(vec) = recovered {
+                    vec
+                } else {
+                    static ZLIB_FAIL_LOGS: AtomicU32 = AtomicU32::new(0);
+                    if ZLIB_FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                        let head_hex: String = raw
+                            .iter()
+                            .take(16)
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
+                        boot_trace(
+                            "xcrd_pc",
+                            "IDStorageQueueX::ZLIB_FAIL",
+                            &format!(
+                                "rc={rc:?} raw_rc={raw_rc:?} src={src_len} dst={dst_len} off={:#x} opts={:#x} inter={:#x} head={head_hex}",
+                                r.source_offset, r.options, r.intermediate_size
+                            ),
+                        );
+                    }
+                    return INVALID_DATA;
+                }
             }
         }
     } else {
