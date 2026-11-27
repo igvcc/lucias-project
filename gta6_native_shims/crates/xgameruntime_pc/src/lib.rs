@@ -1470,6 +1470,15 @@ extern "system" fn gamesave_get_quota_result(
         std::ptr::null_mut(),
     )
 }
+extern "system" fn gamesave_enum_containers_all(
+    _: This,
+    _prov: *mut GameSaveProvider,
+    _ctx: *mut c_void,
+    _cb: *const c_void,
+) -> HRESULT {
+    boot_trace("xgameruntime", "XGameSave::EnumContainersAll", "called");
+    S_OK
+}
 extern "system" fn gamesave_enum_containers(
     _: This,
     _prov: *mut GameSaveProvider,
@@ -1618,7 +1627,7 @@ static GAMESAVE_VTABLE: Vtable<30> = {
     t[7] = gamesave_get_quota as *const c_void;
     t[8] = gamesave_get_quota_async as *const c_void;
     t[9] = gamesave_get_quota_result as *const c_void;
-    t[13] = gamesave_enum_containers as *const c_void;
+    t[13] = gamesave_enum_containers_all as *const c_void;
     t[14] = gamesave_enum_containers as *const c_void;
     t[16] = gamesave_create_container as *const c_void;
     t[17] = gamesave_close_container as *const c_void;
