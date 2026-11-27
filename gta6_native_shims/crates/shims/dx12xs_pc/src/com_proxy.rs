@@ -2986,6 +2986,10 @@ extern "system" fn dev_copy_descriptors_simple(
     ) else {
         return;
     };
+    static COPY_SIMPLE_LOGS: AtomicU32 = AtomicU32::new(0);
+    if COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+        boot_trace("dx12xs_pc", "DeviceX::CopyDescriptorsSimple", &format!("n={n} ty={heap_ty} dst={dst:#x}->{pc_dst:#x} src={src:#x}->{pc_src:#x}"));
+    }
     let real = unsafe { &*this }.real_device;
     type FnTy = unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32);
     unsafe { com_slot::<FnTy>(real, 24)(real, n, pc_dst, pc_src, heap_ty) }

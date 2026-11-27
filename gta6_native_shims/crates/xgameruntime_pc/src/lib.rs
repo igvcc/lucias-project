@@ -1177,6 +1177,7 @@ extern "system" fn xuser_reg_change(
     _cb: *const c_void,
     tok: *mut u64,
 ) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::RegisterForChangeEvent", &format!("cb={_cb:?} ctx={_ctx:?}"));
     put(tok, NEXT_TOKEN.fetch_add(1, Ordering::Relaxed))
 }
 extern "system" fn xuser_unreg_change(_: This, _tok: u64, _wait: bool) -> bool {
