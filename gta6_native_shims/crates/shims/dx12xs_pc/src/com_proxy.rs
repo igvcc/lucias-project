@@ -6667,8 +6667,14 @@ extern "system" fn list_ia_set_vertex_buffers(this: *mut ListX, start: u32, coun
                 used_uma = true;
                 static UMA_VB_LOGS: AtomicU32 = AtomicU32::new(0);
                 let n = UMA_VB_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 16 {
-                    let preview = if n <= 4 && sz >= 16 {
+                static LARGE_VB_LOGS: AtomicU32 = AtomicU32::new(0);
+                let large_n = if sz > 4080 {
+                    LARGE_VB_LOGS.fetch_add(1, Ordering::Relaxed) + 1
+                } else {
+                    999
+                };
+                if n <= 8 || large_n <= 8 {
+                    let preview = if sz >= 16 {
                         let f = unsafe { (v[0] as *const [f32; 4]).read_unaligned() };
                         format!(" f0=[{:.3},{:.3},{:.3},{:.3}]", f[0], f[1], f[2], f[3])
                     } else {
@@ -6677,7 +6683,7 @@ extern "system" fn list_ia_set_vertex_buffers(this: *mut ListX, start: u32, coun
                     boot_trace(
                         "dx12xs_pc",
                         "ListX::IASetVertexBuffers(uma-upload)",
-                        &format!("#{n} list={real:?} slot={i} xb={:#x} pc={pc_va:#x} size={sz} stride={stride}{preview}", v[0]),
+                        &format!("#{n}(L{large_n}) list={real:?} slot={i} xb={:#x} pc={pc_va:#x} size={sz} stride={stride}{preview}", v[0]),
                     );
                 }
             } else {

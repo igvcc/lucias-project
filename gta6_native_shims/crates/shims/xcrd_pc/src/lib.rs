@@ -548,12 +548,14 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
     // 2. Decompress if requested (ZLIB supported via zlib-rs).
     let payload: Vec<u8> = if (r.options & OPT_BCPACK_MASK) != 0 {
         static BCPACK_LOGS: AtomicU32 = AtomicU32::new(0);
-        if BCPACK_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+        let bc_n = BCPACK_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+        if bc_n <= 16 || bc_n % 100 == 0 {
+            let head = raw.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
             boot_trace(
                 "xcrd_pc",
                 "IDStorageQueueX::BCPACK_WARN",
                 &format!(
-                    "options={:#x} src={} dst={}",
+                    "#{bc_n} options={:#x} src={} dst={} head=[{head}]",
                     r.options, r.source_size, r.destination_size
                 ),
             );

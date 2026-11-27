@@ -115,14 +115,19 @@ pub(crate) fn maybe_diag_advance_boot_stage() {
         None
     };
     let obj4dee = safe_read_copy::<usize>(base.saturating_add(0x098C_0F20)).unwrap_or(0);
-    let obj4dee_90 = (obj4dee >= 0x10000).then(|| safe_read_copy::<u64>(obj4dee + 0x90)).flatten();
-    let obj5c8f = safe_read_copy::<usize>(base.saturating_add(0x09AB_3048)).unwrap_or(0);
+    let obj4dee_90 = (obj4dee >= 0x10000).then(|| safe_read_copy::<usize>(obj4dee + 0x90)).flatten().unwrap_or(0);
+    let obj4dee_vt = (obj4dee_90 >= 0x10000)
+        .then(|| safe_read_copy::<usize>(obj4dee_90))
+        .flatten()
+        .map(|vt| vt.saturating_sub(base));
+    let obj5c8f_8 = safe_read_copy::<usize>(base.saturating_add(0x09AB_3048 + 8)).unwrap_or(0);
+    let obj5c8f_10 = safe_read_copy::<usize>(base.saturating_add(0x09AB_3048 + 0x10)).unwrap_or(0);
     if safe_read_copy::<u32>(done_flag_addr) == Some(0) && safe_write_u32(done_flag_addr, 1) {
         boot_trace(
             "dx12xs_pc",
             "PresentContext::diag_advance_boot_stage",
             &format!(
-                "cur_id={cur_id} -> done_flag=1 user_idx={user_idx} user_flags={user_flags:?} obj4dee={obj4dee:#x} +0x90={obj4dee_90:?} obj5c8f={obj5c8f:#x}"
+                "cur_id={cur_id} -> done_flag=1 user_idx={user_idx} user_flags={user_flags:?} obj4dee_90={obj4dee_90:#x} vt_rva={obj4dee_vt:#x?} obj5c8f+8={obj5c8f_8:#x} +10={obj5c8f_10:#x}"
             ),
         );
     }
