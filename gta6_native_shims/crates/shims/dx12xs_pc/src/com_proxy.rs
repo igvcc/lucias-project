@@ -1797,8 +1797,10 @@ fn get_or_create_compute_rs_upgrade(d: &DeviceX, orig_rs: *mut c_void) -> *mut c
         }
         let desc_flags = if sanitized.version >= 2 { 0x2 } else { 0 };
         params.push([4, 0, 252, 1, desc_flags, 0, 0, 0]); // UAV u252 space1
+        params.push([3, 0, 252, 1, desc_flags, 0, 0, 0]); // SRV t252 space1
         params.push([3, 0, 254, 1, desc_flags, 0, 0, 0]); // SRV t254 space1
         params.push([2, 0, 3, 1, desc_flags, 0, 0, 0]); // CBV b3 space1
+        params.push([2, 0, 29, 1, desc_flags, 0, 0, 0]); // CBV b29 space1
         sanitized.desc.num_parameters = params.len() as u32;
         sanitized.desc.parameters = params.as_ptr().cast();
         let mut ser_blob: *mut c_void = std::ptr::null_mut();
