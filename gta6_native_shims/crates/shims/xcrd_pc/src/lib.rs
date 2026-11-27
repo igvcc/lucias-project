@@ -36,8 +36,10 @@ pub const IID_DSTORAGE_FACTORY_PC: Guid = Guid::new(
 const IID_IUNKNOWN: Guid = Guid::new(0x0000_0000, 0x0000, 0x0000, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
 
 const E_PENDING: HRESULT = 0x8000_000A_u32 as i32;
+const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
+const MAX_DSTORAGE_REQ_BYTES: usize = 256 * 1024 * 1024;
 
 const OPT_ZLIB: u64 = 1;
 const OPT_BCPACK_MASK: u64 = 0xF << 1;
@@ -486,6 +488,13 @@ extern "system" fn queue_release(this: *mut QueueObject) -> u32 {
     left
 }
 
+fn try_alloc_zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).ok()?;
+    v.resize(len, 0);
+    Some(v)
+}
+
 fn execute_request(r: &DStorageRequest) -> HRESULT {
     if r.source.is_null() || r.destination.is_null() {
         return E_INVALIDARG;
@@ -495,9 +504,25 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
     if dst_len == 0 {
         return S_OK;
     }
+    if src_len > MAX_DSTORAGE_REQ_BYTES || dst_len > MAX_DSTORAGE_REQ_BYTES {
+        static BAD_SIZE_LOGS: AtomicU32 = AtomicU32::new(0);
+        if BAD_SIZE_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+            boot_trace(
+                "xcrd_pc",
+                "IDStorageQueueX::BAD_SIZE",
+                &format!(
+                    "src={src_len:#x} dst={dst_len:#x} off={:#x} options={:#x}",
+                    r.source_offset, r.options
+                ),
+            );
+        }
+        return E_INVALIDARG;
+    }
 
     // 1. Read source bytes (file or memory).
-    let mut raw = vec![0u8; src_len];
+    let Some(mut raw) = try_alloc_zeroed(src_len) else {
+        return E_OUTOFMEMORY;
+    };
     if (r.options & OPT_MEMORY_SOURCE) != 0 {
         if src_len > 0 {
             let src_ptr = unsafe { r.source.cast::<u8>().add(r.source_offset as usize) };
@@ -533,7 +558,9 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
         }
         raw
     } else if (r.options & OPT_ZLIB) != 0 {
-        let mut out = vec![0u8; dst_len];
+        let Some(mut out) = try_alloc_zeroed(dst_len) else {
+            return E_OUTOFMEMORY;
+        };
         let (res, rc) =
             zlib_rs::decompress_slice(&mut out, &raw, zlib_rs::InflateConfig::default());
         if rc != zlib_rs::ReturnCode::Ok {
@@ -805,6 +832,7 @@ extern "system" fn queue_submit(this: *mut QueueObject) {
     }
     static TOTAL_READ_BYTES: AtomicU64 = AtomicU64::new(0);
     static REQ_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
+    static ERR_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
     static TTDB_REQ_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
     static STATUS_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
     static TTDB_STATUS_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
@@ -819,8 +847,9 @@ extern "system" fn queue_submit(this: *mut QueueObject) {
                 let is_ttdb = is_ttdb_request(&req);
                 let hr = execute_request(&req);
                 let rn = REQ_DONE_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+                let log_err = hr < 0 && ERR_DONE_LOGS.fetch_add(1, Ordering::Relaxed) < 64;
                 if rn <= 32
-                    || hr < 0
+                    || log_err
                     || (is_ttdb && TTDB_REQ_DONE_LOGS.fetch_add(1, Ordering::Relaxed) < 64)
                 {
                     boot_trace_hr(
@@ -1091,5 +1120,24 @@ mod tests {
         // Null and unmapped pointers must not crash.
         assert_eq!(safe_copy_to_dst(std::ptr::null_mut(), &data), S_OK);
         assert_eq!(safe_copy_to_dst(0x1000usize as *mut u8, &data), S_OK);
+    }
+
+    #[test]
+    fn execute_request_rejects_oversized_source_without_abort() {
+        let mut dst = [0u8; 64];
+        let src = [0u8; 64];
+        let req = DStorageRequest {
+            options: OPT_MEMORY_SOURCE,
+            destination: dst.as_mut_ptr().cast(),
+            page_offset: 0,
+            destination_size: 64,
+            source: src.as_ptr().cast(),
+            source_offset: 0,
+            source_size: 0xAEC4_BAB9,
+            intermediate_size: 0,
+            cancellation_tag: 0,
+            name: std::ptr::null(),
+        };
+        assert_eq!(execute_request(&req), E_INVALIDARG);
     }
 }
