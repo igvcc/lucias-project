@@ -3535,7 +3535,7 @@ extern "system" fn dev_copy_descriptors_simple(
     let s13_copy = heap_ty == 0
         && crate::read_app_state() == Some(13)
         && S13_COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 32;
-    let high_copy = heap_ty == 0 && dst >= 0x1da0_0000 && dst <= 0x1eb0_0000 && HIGH_COPY_LOGS.fetch_add(1, Ordering::Relaxed) < 16;
+    let high_copy = heap_ty == 0 && (0x1da0_0000..=0x1eb0_0000).contains(&dst) && HIGH_COPY_LOGS.fetch_add(1, Ordering::Relaxed) < 16;
     if (heap_ty == 0 && COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 8) || s13_copy || high_copy {
         boot_trace("dx12xs_pc", "DeviceX::CopyDescriptorsSimple(ty0)", &format!("n={n} ty={heap_ty} s13={s13_copy} dst={dst:#x}->{pc_dst:#x} src={src:#x}->{pc_src:#x}"));
     }

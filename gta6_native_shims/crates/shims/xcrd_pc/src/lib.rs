@@ -590,7 +590,7 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
         if let Some(decoded) = decode_bcpack(mode, &raw, dst_len) {
             static BCPACK_OK_LOGS: AtomicU32 = AtomicU32::new(0);
             let ok_n = BCPACK_OK_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-            if ok_n <= 8 || ok_n % 200 == 0 {
+            if ok_n <= 8 || ok_n.is_multiple_of(200) {
                 boot_trace(
                     "xcrd_pc",
                     "IDStorageQueueX::BCPACK_OK",
@@ -601,7 +601,7 @@ fn execute_request(r: &DStorageRequest) -> HRESULT {
         } else {
             static BCPACK_LOGS: AtomicU32 = AtomicU32::new(0);
             let bc_n = BCPACK_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-            if bc_n <= 16 || bc_n % 100 == 0 {
+            if bc_n <= 16 || bc_n.is_multiple_of(100) {
                 let head = raw.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
                 boot_trace(
                     "xcrd_pc",
