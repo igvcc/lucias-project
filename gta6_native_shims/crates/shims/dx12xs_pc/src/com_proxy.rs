@@ -6488,6 +6488,7 @@ extern "system" fn list_set_compute_root_table(this: *mut ListX, param: u32, bas
         boot_trace("dx12xs_pc", "ListX::SetComputeRootDescriptorTable", &format!("list={real:?} p={param} xb={base_gpu:#x} pc={pc_gpu:?}"));
     }
     let Some(pc_gpu) = pc_gpu else { return; };
+    record_list_op(this, "SetGfxTbl", u64::from(param), pc_gpu);
     type FnTy = unsafe extern "system" fn(*mut c_void, u32, u64);
     unsafe { com_slot::<FnTy>(real, 31)(real, param, pc_gpu) };
 }
@@ -6499,6 +6500,7 @@ extern "system" fn list_set_graphics_root_table(this: *mut ListX, param: u32, ba
         boot_trace("dx12xs_pc", "ListX::SetGraphicsRootDescriptorTable", &format!("list={real:?} p={param} xb={base_gpu:#x} pc={pc_gpu:?}"));
     }
     let Some(pc_gpu) = pc_gpu else { return; };
+    record_list_op(this, "SetGfxTbl", u64::from(param), pc_gpu);
     type FnTy = unsafe extern "system" fn(*mut c_void, u32, u64);
     unsafe { com_slot::<FnTy>(real, 32)(real, param, pc_gpu) };
 }
@@ -6533,7 +6535,16 @@ extern "system" fn list_set_graphics_root_consts(this: *mut ListX, param: u32, c
     let Some(real) = list_open_real(this) else { return; };
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
-        boot_trace("dx12xs_pc", "ListX::SetGraphicsRoot32BitConstants", &format!("list={real:?} p={param} cnt={cnt} off={off}"));
+        let vals = if !data.is_null() && cnt > 0 {
+            let n = (cnt as usize).min(4);
+            (0..n)
+                .map(|i| format!("{:#x}", unsafe { data.cast::<u32>().add(i).read_unaligned() }))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            String::new()
+        };
+        boot_trace("dx12xs_pc", "ListX::SetGraphicsRoot32BitConstants", &format!("list={real:?} p={param} cnt={cnt} off={off} vals=[{vals}]"));
     }
     type FnTy = unsafe extern "system" fn(*mut c_void, u32, u32, *const c_void, u32);
     unsafe { com_slot::<FnTy>(real, 36)(real, param, cnt, data, off) };
@@ -6657,10 +6668,16 @@ extern "system" fn list_ia_set_vertex_buffers(this: *mut ListX, start: u32, coun
                 static UMA_VB_LOGS: AtomicU32 = AtomicU32::new(0);
                 let n = UMA_VB_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 16 {
+                    let preview = if n <= 4 && sz >= 16 {
+                        let f = unsafe { (v[0] as *const [f32; 4]).read_unaligned() };
+                        format!(" f0=[{:.3},{:.3},{:.3},{:.3}]", f[0], f[1], f[2], f[3])
+                    } else {
+                        String::new()
+                    };
                     boot_trace(
                         "dx12xs_pc",
                         "ListX::IASetVertexBuffers(uma-upload)",
-                        &format!("#{n} list={real:?} slot={i} xb={:#x} pc={pc_va:#x} size={sz} stride={stride}", v[0]),
+                        &format!("#{n} list={real:?} slot={i} xb={:#x} pc={pc_va:#x} size={sz} stride={stride}{preview}", v[0]),
                     );
                 }
             } else {

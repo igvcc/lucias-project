@@ -108,11 +108,22 @@ pub(crate) fn maybe_diag_advance_boot_stage() {
     let done_flag_addr = base
         .saturating_add(RVA_STATE_TBL)
         .saturating_add((cur_id as usize) * 0x50 + 0x18);
+    let user_idx = safe_read_copy::<u32>(base.saturating_add(0x06C3_1B50)).unwrap_or(0xFFFF_FFFF);
+    let user_flags = if user_idx < 4 {
+        safe_read_copy::<u8>(base.saturating_add(0x0984_82B1 + (user_idx as usize) * 0x150 + 0x144))
+    } else {
+        None
+    };
+    let obj4dee = safe_read_copy::<usize>(base.saturating_add(0x098C_0F20)).unwrap_or(0);
+    let obj4dee_90 = (obj4dee >= 0x10000).then(|| safe_read_copy::<u64>(obj4dee + 0x90)).flatten();
+    let obj5c8f = safe_read_copy::<usize>(base.saturating_add(0x09AB_3048)).unwrap_or(0);
     if safe_read_copy::<u32>(done_flag_addr) == Some(0) && safe_write_u32(done_flag_addr, 1) {
         boot_trace(
             "dx12xs_pc",
             "PresentContext::diag_advance_boot_stage",
-            &format!("cur_id={cur_id} -> done_flag=1"),
+            &format!(
+                "cur_id={cur_id} -> done_flag=1 user_idx={user_idx} user_flags={user_flags:?} obj4dee={obj4dee:#x} +0x90={obj4dee_90:?} obj5c8f={obj5c8f:#x}"
+            ),
         );
     }
 }
