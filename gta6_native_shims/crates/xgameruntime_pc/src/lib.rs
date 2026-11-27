@@ -1700,7 +1700,11 @@ extern "system" fn xnet_connectivity_hint(_: This, out: *mut XNetworkingConnecti
     if out.is_null() {
         return E_INVALIDARG;
     }
-    boot_trace("xgameruntime", "XNet::GetConnectivityHint", "initialized=true level=1");
+    static HINT_LOG_N: AtomicU32 = AtomicU32::new(0);
+    let n = HINT_LOG_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        boot_trace("xgameruntime", "XNet::GetConnectivityHint", &format!("initialized=true level=1 count={n}"));
+    }
     unsafe {
         out.write(XNetworkingConnectivityHint {
             connectivity_level: 1, // LocalAccess / offline
@@ -2196,12 +2200,16 @@ pub extern "system" fn QueryApiImpl(
     };
 
     if let Some(obj) = matched {
-        boot_trace_hr(
-            "xgameruntime",
-            "QueryApiImpl",
-            S_OK,
-            &format!("area={} prov={} iid={}", obj.area, prov.format_guid(), id.format_guid()),
-        );
+        static QUERY_LOG_N: AtomicU32 = AtomicU32::new(0);
+        let qn = QUERY_LOG_N.fetch_add(1, Ordering::Relaxed) + 1;
+        if qn <= 32 || qn.is_power_of_two() {
+            boot_trace_hr(
+                "xgameruntime",
+                "QueryApiImpl",
+                S_OK,
+                &format!("area={} prov={} iid={} count={qn}", obj.area, prov.format_guid(), id.format_guid()),
+            );
+        }
         unsafe { *out = (obj as *const RuntimeObject).cast_mut().cast() };
         S_OK
     } else {

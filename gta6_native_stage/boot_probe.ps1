@@ -23,11 +23,11 @@ if ($MemLimitMb -gt 12288 -or $MemLimitMb -lt 256) {
     throw "Safety rule: MemLimitMb must be between 256 and 12288 (got $MemLimitMb)"
 }
 
-# 1. Ensure no leftover LuciasProject.exe or GTA6_PC.exe is running
+# 1. Ensure no leftover LuciasProject.exe or GTA6_PC.exe is running (only if -KillStray is desired; Job Object kills our own child)
 foreach ($procName in @("LuciasProject", "GTA6_PC")) {
-    $stray = Get-Process -Name $procName -ErrorAction SilentlyContinue
+    $stray = Get-Process -Name $procName -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($StageDir, [System.StringComparison]::OrdinalIgnoreCase) }
     if ($stray) {
-        Write-Warning "Killing stray $procName.exe before probe..."
+        Write-Warning "Killing stray $procName.exe in $StageDir before probe..."
         $stray | Stop-Process -Force
     }
 }
@@ -42,18 +42,18 @@ if (-not $SkipVerify) {
     }
 }
 
-# 3. Prepare log directory & fresh shim_trace.log / telemetry_latest.json
+# 3. Prepare log directory & archive previous shim_trace.log / telemetry_latest.json
 $logDir = Join-Path $StageDir "logs"
 if (-not (Test-Path -LiteralPath $logDir)) {
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 }
 $shimLog = Join-Path $logDir "shim_trace.log"
-if (Test-Path -LiteralPath $shimLog) {
-    Remove-Item -LiteralPath $shimLog -Force
-}
 $telemetryJson = Join-Path $logDir "telemetry_latest.json"
-if (Test-Path -LiteralPath $telemetryJson) {
-    Remove-Item -LiteralPath $telemetryJson -Force
+if ((Test-Path -LiteralPath $shimLog) -or (Test-Path -LiteralPath $telemetryJson)) {
+    $archDir = Join-Path $logDir ("archive\" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+    New-Item -ItemType Directory -Path $archDir -Force | Out-Null
+    if (Test-Path -LiteralPath $shimLog) { Move-Item -LiteralPath $shimLog -Destination (Join-Path $archDir "shim_trace.log") -Force }
+    if (Test-Path -LiteralPath $telemetryJson) { Move-Item -LiteralPath $telemetryJson -Destination (Join-Path $archDir "telemetry_latest.json") -Force }
 }
 
 # 4. Ensure gta6_boot_probe.exe is built

@@ -291,6 +291,8 @@ if ($PatcherExe -and (Test-Path -LiteralPath $PatcherExe) -and (Test-Path -Liter
     Assert-Check $vOk "pe_native_patcher verify --hook-vfs" "exit=$LASTEXITCODE"
     Assert-Check ($ana.tls_callbacks.Count -eq 2) "TLS callbacks intact (2)" "count=$($ana.tls_callbacks.Count)"
     Assert-Check ($ana.total_import_count -eq 587) "Total static IAT count == 587" "count=$($ana.total_import_count)"
+} else {
+    Assert-Check $false "pe_native_patcher.exe present for verification" "not found in target/release or target/debug"
 }
 
 # 2. All 14 DLLs present + LoadLibrary + GetProcAddress resolution + no shadow stubs

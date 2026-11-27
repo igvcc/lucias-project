@@ -518,7 +518,7 @@ fn translate_cpu_handle_for_ty(xb_handle: u64, expected_ty: Option<u32>) -> Opti
     None
 }
 
-fn translate_gpu_handle(xb_handle: u64) -> Option<u64> {
+fn translate_gpu_handle_with_idx(xb_handle: u64) -> Option<(u64, u32)> {
     if xb_handle == 0 {
         return None;
     }
@@ -531,7 +531,12 @@ fn translate_gpu_handle(xb_handle: u64) -> Option<u64> {
             .pc_gpu_start
             .saturating_add(u64::from(r.pc_count).saturating_mul(u64::from(r.pc_stride)));
         if xb_handle >= r.pc_gpu_start && xb_handle < pc_gpu_end {
-            return Some(xb_handle);
+            let idx = if r.pc_stride > 0 {
+                ((xb_handle - r.pc_gpu_start) / u64::from(r.pc_stride)) as u32
+            } else {
+                0
+            };
+            return Some((xb_handle, idx));
         }
         if xb_handle >= r.xb_start && xb_handle < r.xb_end && r.xb_stride > 0 {
             let idx = (xb_handle - r.xb_start) / u64::from(r.xb_stride);
@@ -540,7 +545,7 @@ fn translate_gpu_handle(xb_handle: u64) -> Option<u64> {
             } else {
                 idx
             };
-            return Some(r.pc_gpu_start + clamped * u64::from(r.pc_stride));
+            return Some((r.pc_gpu_start + clamped * u64::from(r.pc_stride), clamped as u32));
         }
     }
     None
@@ -634,6 +639,7 @@ fn sample_vram_usage(dxgi_adapter3: *mut c_void) {
 }
 
 const UMA_UPLOAD_RING_SIZE: usize = 32 * 1024 * 1024;
+const UMA_CBV_POOL_SIZE: usize = 4 * 1024 * 1024;
 const MAX_UMA_UPLOAD_ALLOC: usize = 4 * 1024 * 1024;
 
 struct UmaUploadRing {
@@ -644,6 +650,26 @@ struct UmaUploadRing {
     cursor: usize,
 }
 unsafe impl Send for UmaUploadRing {}
+
+struct LiveUmaCbv {
+    xb_va: u64,
+    pc_ptr: *mut u8,
+    pc_va: u64,
+    copy_bytes: usize,
+    alloc_bytes: usize,
+}
+unsafe impl Send for LiveUmaCbv {}
+
+struct UmaCbvPool {
+    res: *mut c_void,
+    mapped: *mut u8,
+    gpu_va: u64,
+    size: usize,
+    cursor: usize,
+    live_cbvs: Vec<LiveUmaCbv>,
+    by_xb_va: HashMap<u64, usize>,
+}
+unsafe impl Send for UmaCbvPool {}
 
 pub(crate) fn align_and_wrap_ring_offset(
     cursor: usize,
@@ -685,6 +711,7 @@ pub struct DeviceX {
     compute_rs_upgrades: Mutex<HashMap<usize, usize>>,
     compute_rs_build_lock: Mutex<()>,
     uma_upload_ring: Mutex<Option<UmaUploadRing>>,
+    uma_cbv_pool: Mutex<Option<UmaCbvPool>>,
 }
 
 const _: () = assert!(std::mem::offset_of!(DeviceX, out_of_line) == 0x18);
@@ -801,6 +828,7 @@ pub fn wrap_xbox_device(real_device: *mut c_void, requested_iid: &Guid) -> *mut 
         compute_rs_upgrades: Mutex::new(HashMap::new()),
         compute_rs_build_lock: Mutex::new(()),
         uma_upload_ring: Mutex::new(None),
+        uma_cbv_pool: Mutex::new(None),
     });
     Box::into_raw(dev).cast()
 }
@@ -824,6 +852,80 @@ fn mark_rs_stage_failed(d: &DeviceX, rs: *mut c_void, kind: u8) {
     }
 }
 
+fn create_mapped_upload_buffer(
+    real_device: *mut c_void,
+    size: usize,
+    tag: &str,
+) -> Option<(*mut c_void, *mut u8, u64)> {
+    let heap_props: [u32; 5] = [2, 0, 0, 0, 0]; // D3D12_HEAP_TYPE_UPLOAD
+    let desc = ResourceDescRaw {
+        dimension: 1,
+        alignment: 0,
+        width: size as u64,
+        height: 1,
+        depth_or_array: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 0,
+    };
+    let mut res: *mut c_void = std::ptr::null_mut();
+    type CreateCommFn = unsafe extern "system" fn(
+        *mut c_void,
+        *const [u32; 5],
+        u32,
+        *const ResourceDescRaw,
+        u32,
+        *const c_void,
+        *const Guid,
+        *mut *mut c_void,
+    ) -> HRESULT;
+    let hr = unsafe {
+        com_slot::<CreateCommFn>(real_device, 27)(
+            real_device,
+            &heap_props,
+            0,
+            &desc,
+            0xAC3, // D3D12_RESOURCE_STATE_GENERIC_READ
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut res,
+        )
+    };
+    if hr < 0 || res.is_null() {
+        boot_trace_hr("dx12xs_pc", tag, hr, "CreateCommittedResource failed");
+        return None;
+    }
+    type MapFn = unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+    type GetVaFn = unsafe extern "system" fn(*mut c_void) -> u64;
+    let mut mapped: *mut c_void = std::ptr::null_mut();
+    let hr_map = unsafe { com_slot::<MapFn>(res, 8)(res, 0, std::ptr::null(), &mut mapped) };
+    let gpu_va = unsafe { com_slot::<GetVaFn>(res, 11)(res) };
+    if hr_map < 0 || mapped.is_null() || gpu_va == 0 {
+        boot_trace_hr(
+            "dx12xs_pc",
+            tag,
+            hr_map,
+            &format!("Map/GetVA failed mapped={mapped:?} va={gpu_va:#x}"),
+        );
+        unsafe { real_release(res) };
+        return None;
+    }
+    GPU_RESOURCE_RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((gpu_va, size as u64));
+    boot_trace_hr(
+        "dx12xs_pc",
+        tag,
+        S_OK,
+        &format!("res={res:?} gpu_va={gpu_va:#x} size={size:#x}"),
+    );
+    Some((res, mapped.cast(), gpu_va))
+}
+
 fn upload_cpu_slice_to_gpu_va(
     d: &DeviceX,
     cpu_va: u64,
@@ -844,75 +946,14 @@ fn upload_cpu_slice_to_gpu_va(
     }
     let mut guard = d.uma_upload_ring.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
-        let heap_props: [u32; 5] = [2, 0, 0, 0, 0]; // D3D12_HEAP_TYPE_UPLOAD
-        let desc = ResourceDescRaw {
-            dimension: 1,
-            alignment: 0,
-            width: UMA_UPLOAD_RING_SIZE as u64,
-            height: 1,
-            depth_or_array: 1,
-            mip_levels: 1,
-            format: 0,
-            sample_count: 1,
-            sample_quality: 0,
-            layout: 1,
-            flags: 0,
-        };
-        let mut res: *mut c_void = std::ptr::null_mut();
-        type CreateCommFn = unsafe extern "system" fn(
-            *mut c_void,
-            *const [u32; 5],
-            u32,
-            *const ResourceDescRaw,
-            u32,
-            *const c_void,
-            *const Guid,
-            *mut *mut c_void,
-        ) -> HRESULT;
-        let hr = unsafe {
-            com_slot::<CreateCommFn>(d.real_device, 27)(
-                d.real_device,
-                &heap_props,
-                0,
-                &desc,
-                0xAC3, // D3D12_RESOURCE_STATE_GENERIC_READ
-                std::ptr::null(),
-                &RESOURCE_IIDS[0],
-                &mut res,
-            )
-        };
-        if hr < 0 || res.is_null() {
-            boot_trace_hr("dx12xs_pc", "DeviceX::UmaUploadRing::init", hr, "CreateCommittedResource failed");
-            return None;
-        }
-        type MapFn = unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
-        type GetVaFn = unsafe extern "system" fn(*mut c_void) -> u64;
-        let mut mapped: *mut c_void = std::ptr::null_mut();
-        let hr_map = unsafe { com_slot::<MapFn>(res, 8)(res, 0, std::ptr::null(), &mut mapped) };
-        let gpu_va = unsafe { com_slot::<GetVaFn>(res, 11)(res) };
-        if hr_map < 0 || mapped.is_null() || gpu_va == 0 {
-            boot_trace_hr(
-                "dx12xs_pc",
-                "DeviceX::UmaUploadRing::init",
-                hr_map,
-                &format!("Map/GetVA failed mapped={mapped:?} va={gpu_va:#x}"),
-            );
-            unsafe { real_release(res) };
-            return None;
-        }
-        GPU_RESOURCE_RANGES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((gpu_va, UMA_UPLOAD_RING_SIZE as u64));
-        boot_trace_hr(
-            "dx12xs_pc",
+        let (res, mapped, gpu_va) = create_mapped_upload_buffer(
+            d.real_device,
+            UMA_UPLOAD_RING_SIZE,
             "DeviceX::UmaUploadRing::init",
-            S_OK,
-            &format!("res={res:?} gpu_va={gpu_va:#x} size={UMA_UPLOAD_RING_SIZE:#x}"),
-        );
+        )?;
         *guard = Some(UmaUploadRing {
             res,
-            mapped: mapped.cast(),
+            mapped,
             gpu_va,
             size: UMA_UPLOAD_RING_SIZE,
             cursor: 0,
@@ -928,6 +969,101 @@ fn upload_cpu_slice_to_gpu_va(
         }
     }
     Some(ring.gpu_va + off as u64)
+}
+
+fn alloc_or_reuse_uma_cbv(
+    d: &DeviceX,
+    cpu_va: u64,
+    copy_bytes: usize,
+    alloc_bytes: usize,
+) -> Option<u64> {
+    if cpu_va < 0x10000
+        || copy_bytes == 0
+        || alloc_bytes < copy_bytes
+        || alloc_bytes > 64 * 1024
+        || d.real_device.is_null()
+    {
+        return None;
+    }
+    if !is_readable_bytes(cpu_va as *const c_void, copy_bytes) {
+        return None;
+    }
+    let mut guard = d.uma_cbv_pool.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        let (res, mapped, gpu_va) = create_mapped_upload_buffer(
+            d.real_device,
+            UMA_CBV_POOL_SIZE,
+            "DeviceX::UmaCbvPool::init",
+        )?;
+        *guard = Some(UmaCbvPool {
+            res,
+            mapped,
+            gpu_va,
+            size: UMA_CBV_POOL_SIZE,
+            cursor: 0,
+            live_cbvs: Vec::new(),
+            by_xb_va: HashMap::new(),
+        });
+    }
+    let pool = guard.as_mut()?;
+    if let Some(&idx) = pool.by_xb_va.get(&cpu_va) {
+        let cbv = &mut pool.live_cbvs[idx];
+        if cbv.alloc_bytes >= alloc_bytes {
+            cbv.copy_bytes = copy_bytes;
+            unsafe {
+                std::ptr::copy_nonoverlapping(cpu_va as *const u8, cbv.pc_ptr, copy_bytes);
+                if cbv.alloc_bytes > copy_bytes {
+                    std::ptr::write_bytes(cbv.pc_ptr.add(copy_bytes), 0, cbv.alloc_bytes - copy_bytes);
+                }
+            }
+            return Some(cbv.pc_va);
+        }
+    }
+    let aligned = pool.cursor.next_multiple_of(256);
+    if aligned.saturating_add(alloc_bytes) > pool.size {
+        static CBV_POOL_FULL: AtomicBool = AtomicBool::new(false);
+        if !CBV_POOL_FULL.swap(true, Ordering::Relaxed) {
+            boot_trace(
+                "dx12xs_pc",
+                "DeviceX::UmaCbvPool::full",
+                &format!("cursor={:#x} alloc={alloc_bytes:#x} size={:#x}", pool.cursor, pool.size),
+            );
+        }
+        return None;
+    }
+    pool.cursor = aligned + alloc_bytes;
+    let pc_ptr = unsafe { pool.mapped.add(aligned) };
+    let pc_va = pool.gpu_va + aligned as u64;
+    unsafe {
+        std::ptr::copy_nonoverlapping(cpu_va as *const u8, pc_ptr, copy_bytes);
+        if alloc_bytes > copy_bytes {
+            std::ptr::write_bytes(pc_ptr.add(copy_bytes), 0, alloc_bytes - copy_bytes);
+        }
+    }
+    let idx = pool.live_cbvs.len();
+    pool.live_cbvs.push(LiveUmaCbv {
+        xb_va: cpu_va,
+        pc_ptr,
+        pc_va,
+        copy_bytes,
+        alloc_bytes,
+    });
+    pool.by_xb_va.insert(cpu_va, idx);
+    Some(pc_va)
+}
+
+fn refresh_live_uma_cbvs(d: &DeviceX) {
+    let guard = d.uma_cbv_pool.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pool) = guard.as_ref() else {
+        return;
+    };
+    for cbv in &pool.live_cbvs {
+        if is_readable_bytes(cbv.xb_va as *const c_void, cbv.copy_bytes) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(cbv.xb_va as *const u8, cbv.pc_ptr, cbv.copy_bytes);
+            }
+        }
+    }
 }
 
 fn ensure_null_cb_gpu_va(d: &DeviceX) -> u64 {
@@ -1064,6 +1200,12 @@ extern "system" fn dev_release(this: *mut DeviceX) -> u32 {
             unregister_gpu_buffer_va(ring.gpu_va);
             if !ring.res.is_null() {
                 unsafe { real_release(ring.res) };
+            }
+        }
+        if let Some(pool) = boxed.uma_cbv_pool.into_inner().ok().flatten() {
+            unregister_gpu_buffer_va(pool.gpu_va);
+            if !pool.res.is_null() {
+                unsafe { real_release(pool.res) };
             }
         }
         if !boxed.info_queue.is_null() {
@@ -2451,6 +2593,7 @@ extern "system" fn dev_create_command_list(
         recent_ops: Mutex::new(([("", 0, 0); 16], 0)),
         last_pso: AtomicUsize::new(real_pso as usize),
         last_gfx_rs: AtomicUsize::new(0),
+        last_cmp_rs: AtomicUsize::new(0),
         last_vb_count: AtomicU32::new(0),
         last_rtv_count: AtomicU32::new(0),
     });
@@ -2878,12 +3021,11 @@ extern "system" fn dev_create_cbv(this: *mut DeviceX, desc: *const c_void, cpu: 
         };
         unsafe { com_slot::<FnTy>(real, 17)(real, (&raw const clean).cast(), pc_cpu) };
     } else if raw_cbv.buffer_location != 0 && aligned_size > 0 {
-        if let Some(pc_va) = upload_cpu_slice_to_gpu_va(
+        if let Some(pc_va) = alloc_or_reuse_uma_cbv(
             d,
             raw_cbv.buffer_location,
             (raw_cbv.size_in_bytes as usize).min(aligned_size as usize),
             aligned_size as usize,
-            256,
         ) {
             static UMA_CBV_LOGS: AtomicU32 = AtomicU32::new(0);
             let n = UMA_CBV_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5289,6 +5431,7 @@ extern "system" fn queue_execute(this: *mut QueueX, count: u32, lists: *const *m
     static EXEC_CALLS: AtomicU32 = AtomicU32::new(0);
     let call_n = EXEC_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     let parent = unsafe { &*q.parent_dev };
+    refresh_live_uma_cbvs(parent);
     let real_dev = parent.real_device;
     let pre = query_real_removed_reason(real_dev);
     if call_n <= 16 || unclosed > 0 {
@@ -5938,6 +6081,7 @@ pub struct ListX {
     recent_ops: Mutex<ListOpsRing>,
     last_pso: AtomicUsize,
     last_gfx_rs: AtomicUsize,
+    last_cmp_rs: AtomicUsize,
     last_vb_count: AtomicU32,
     last_rtv_count: AtomicU32,
 }
@@ -6114,6 +6258,7 @@ extern "system" fn list_reset(this: *mut ListX, alloc: *mut AllocatorX, pso: *mu
         clear_list_ops(l);
         l.last_pso.store(real_pso as usize, Ordering::Relaxed);
         l.last_gfx_rs.store(0, Ordering::Relaxed);
+        l.last_cmp_rs.store(0, Ordering::Relaxed);
         l.last_vb_count.store(0, Ordering::Relaxed);
         l.last_rtv_count.store(0, Ordering::Relaxed);
         if rn <= 128 {
@@ -6746,9 +6891,43 @@ fn bind_synthetic_b0_for_root_sig(this: *mut ListX, real_list: *mut c_void, root
         }
     }
 }
+fn bind_userdata_b0_for_table0(this: *mut ListX, real_list: *mut c_void, desc_idx: u32, is_compute: bool) {
+    if this.is_null() || DIAG_SKIP.bind_b0 {
+        return;
+    }
+    let l = unsafe { &*this };
+    if l.parent_dev.is_null() {
+        return;
+    }
+    let rs = if is_compute {
+        l.last_cmp_rs.load(Ordering::Relaxed)
+    } else {
+        l.last_gfx_rs.load(Ordering::Relaxed)
+    };
+    if rs == 0 {
+        return;
+    }
+    let d = unsafe { &*l.parent_dev };
+    let b0_slot = d
+        .synthetic_rs_slots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&rs)
+        .and_then(|s| s.b0_slot);
+    if let Some(b0_idx) = b0_slot {
+        let mut ud = [0u32; 12];
+        ud[8] = desc_idx.wrapping_mul(32);
+        if let Some(cb_va) = upload_cpu_slice_to_gpu_va(d, ud.as_ptr() as u64, 48, 256, 256) {
+            let cbv_slot = if is_compute { 37 } else { 38 };
+            type ViewFn = unsafe extern "system" fn(*mut c_void, u32, u64);
+            unsafe { com_slot::<ViewFn>(real_list, cbv_slot)(real_list, b0_idx, cb_va) };
+        }
+    }
+}
 extern "system" fn list_set_compute_root_sig(this: *mut ListX, root_sig: *mut c_void) {
     let Some(real) = list_open_real(this) else { return; };
     let l = unsafe { &*this };
+    l.last_cmp_rs.store(root_sig as usize, Ordering::Relaxed);
     let use_rs = if l.last_cmp_pso_upgrade.load(Ordering::Acquire) != 0 && !l.parent_dev.is_null() {
         let d = unsafe { &*l.parent_dev };
         d.compute_rs_upgrades
@@ -6787,27 +6966,33 @@ extern "system" fn list_set_graphics_root_sig(this: *mut ListX, root_sig: *mut c
 }
 extern "system" fn list_set_compute_root_table(this: *mut ListX, param: u32, base_gpu: u64) {
     let Some(real) = list_open_real(this) else { return; };
-    let pc_gpu = translate_gpu_handle(base_gpu);
+    let pc_pair = translate_gpu_handle_with_idx(base_gpu);
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
-        boot_trace("dx12xs_pc", "ListX::SetComputeRootDescriptorTable", &format!("list={real:?} p={param} xb={base_gpu:#x} pc={pc_gpu:?}"));
+        boot_trace("dx12xs_pc", "ListX::SetComputeRootDescriptorTable", &format!("list={real:?} p={param} xb={base_gpu:#x} pc={:?}", pc_pair.map(|v| v.0)));
     }
-    let Some(pc_gpu) = pc_gpu else { return; };
+    let Some((pc_gpu, desc_idx)) = pc_pair else { return; };
     record_list_op(this, "SetGfxTbl", u64::from(param), pc_gpu);
     type FnTy = unsafe extern "system" fn(*mut c_void, u32, u64);
     unsafe { com_slot::<FnTy>(real, 31)(real, param, pc_gpu) };
+    if param == 0 {
+        bind_userdata_b0_for_table0(this, real, desc_idx, true);
+    }
 }
 extern "system" fn list_set_graphics_root_table(this: *mut ListX, param: u32, base_gpu: u64) {
     let Some(real) = list_open_real(this) else { return; };
-    let pc_gpu = translate_gpu_handle(base_gpu);
+    let pc_pair = translate_gpu_handle_with_idx(base_gpu);
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
-        boot_trace("dx12xs_pc", "ListX::SetGraphicsRootDescriptorTable", &format!("list={real:?} p={param} xb={base_gpu:#x} pc={pc_gpu:?}"));
+        boot_trace("dx12xs_pc", "ListX::SetGraphicsRootDescriptorTable", &format!("list={real:?} p={param} xb={base_gpu:#x} pc={:?}", pc_pair.map(|v| v.0)));
     }
-    let Some(pc_gpu) = pc_gpu else { return; };
+    let Some((pc_gpu, desc_idx)) = pc_pair else { return; };
     record_list_op(this, "SetGfxTbl", u64::from(param), pc_gpu);
     type FnTy = unsafe extern "system" fn(*mut c_void, u32, u64);
     unsafe { com_slot::<FnTy>(real, 32)(real, param, pc_gpu) };
+    if param == 0 {
+        bind_userdata_b0_for_table0(this, real, desc_idx, false);
+    }
 }
 extern "system" fn list_set_compute_root_const(this: *mut ListX, param: u32, data: u32, off: u32) {
     let Some(real) = list_open_real(this) else { return; };
