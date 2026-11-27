@@ -1302,6 +1302,8 @@ fn wrap_pipeline_ex(
         diag_rtv0_fmt: 0,
         diag_depth_en: 0,
         diag_depth_func: 0,
+        diag_vs_hash: 0,
+        diag_ps_hash: 0,
     });
     Box::into_raw(pso).cast()
 }
@@ -2302,6 +2304,13 @@ extern "system" fn dev_create_pipeline_state_stream(
             p.diag_rtv0_fmt = rtv_fmts_logged[0];
             p.diag_depth_en = depth_en_logged;
             p.diag_depth_func = depth_fn_logged;
+            for (st, h, _, _) in &stage_dumps {
+                if *st == "VS" {
+                    p.diag_vs_hash = *h;
+                } else if *st == "PS" || *st == "CS" {
+                    p.diag_ps_hash = *h;
+                }
+            }
             *out = wrapped;
         }
         static OK_LOGS: AtomicU32 = AtomicU32::new(0);
@@ -4824,6 +4833,8 @@ pub struct PipelineX {
     diag_rtv0_fmt: u32,
     diag_depth_en: u32,
     diag_depth_func: u32,
+    diag_vs_hash: u64,
+    diag_ps_hash: u64,
 }
 
 const _: () = assert!(size_of::<PipelineX>() >= 0x40);
@@ -6134,8 +6145,8 @@ extern "system" fn list_set_pso(this: *mut ListX, pso: *mut PipelineX) {
             "dx12xs_pc",
             "ListX::SetPipelineState",
             &format!(
-                "#{n}(s13:{s13_n}) list={:?} pso={pso:?} real_pso={real_pso:?} fb={} rtv0={} dsv={} depth_en={} depth_fn={}",
-                l.real_list, p_ref.used_fallback_rs, p_ref.diag_rtv0_fmt, p_ref.diag_dsv_fmt, p_ref.diag_depth_en, p_ref.diag_depth_func
+                "#{n}(s13:{s13_n}) list={:?} pso={pso:?} real_pso={real_pso:?} fb={} rtv0={} dsv={} depth_en={} depth_fn={} vs={:#018x} ps={:#018x}",
+                l.real_list, p_ref.used_fallback_rs, p_ref.diag_rtv0_fmt, p_ref.diag_dsv_fmt, p_ref.diag_depth_en, p_ref.diag_depth_func, p_ref.diag_vs_hash, p_ref.diag_ps_hash
             ),
         );
     }
