@@ -1,0 +1,17 @@
+[package]
+name = "xcrd_pc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "xcrd_pc"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shim_common = { path = "../shim_common" }
+windows-sys.workspace = true
+zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

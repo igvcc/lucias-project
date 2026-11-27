@@ -1,0 +1,7 @@
+LIBRARY chad_pc
+EXPORTS
+    XDspActivate
+    XDspConnectWithMaximumStreamLimit
+    XDspDeactivate
+    XDspDisconnect
+    XDspSubmitCommand

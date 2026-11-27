@@ -1,0 +1,13 @@
+[package]
+name = "gameinput_shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "GameInput"
+crate-type = ["cdylib"]
+
+[dependencies]
+shim_common = { path = "../shim_common" }
+windows-sys.workspace = true

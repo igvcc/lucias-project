@@ -1,0 +1,6 @@
+LIBRARY ffx_pc
+EXPORTS
+    ffxCreateContext
+    ffxDestroyContext
+    ffxDispatch
+    ffxQuery

@@ -1,0 +1,25 @@
+LIBRARY bink2_pc
+EXPORTS
+    BinkClose
+    BinkDoFrame
+    BinkDoFrameAsyncMulti
+    BinkDoFrameAsyncWait
+    BinkFreeGlobals
+    BinkGetFrameBuffersInfo
+    BinkGetKeyFrame
+    BinkGetPlatformInfo
+    BinkGoto
+    BinkNextFrame
+    BinkOpenWithOptions
+    BinkPause
+    BinkRegisterFrameBuffers
+    BinkRequestStopAsyncThreadsMulti
+    BinkSetMemory
+    BinkSetOSFileCallbacks
+    BinkSetSoundSystem
+    BinkSetVolume
+    BinkSetWillLoop
+    BinkShouldSkip
+    BinkStartAsyncThread
+    BinkWait
+    BinkWaitStopAsyncThreadsMulti

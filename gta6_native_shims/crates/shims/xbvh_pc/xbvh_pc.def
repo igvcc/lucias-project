@@ -1,0 +1,9 @@
+LIBRARY xbvh_pc
+EXPORTS
+    ??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z = xbvh_ctor
+    ??1XboxBvhBuilder@@QEAA@XZ = xbvh_dtor
+    ?BuildRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList6@@IPEBUD3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2@@@Z = xbvh_build_batched_2x
+    ?CopyRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@_K1W4D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE@@@Z = xbvh_copy_rtas
+    ?GetRaytracingAccelerationStructurePrebuildInfo@XboxBvhBuilder@@QEAAXPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS@@PEBUD3D12XBOX_XDXR_STREAM_DESC@@PEAUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO@@@Z = xbvh_get_prebuild_info
+    ?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z = xbvh_rehydrate_batched_2x
+    ?Set64BitMortonCodes@XboxBvhBuilder@@QEAAX_N@Z = xbvh_set_64bit_morton_codes

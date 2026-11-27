@@ -1,0 +1,16 @@
+LIBRARY xmem_pc
+EXPORTS
+    XMemAlloc
+    XMemAllocDefault
+    XMemAllocatePhysicalPages
+    XMemFree
+    XMemFreeDefault
+    XMemFreePhysicalPages
+    XMemGetWorkingSetStatistics
+    XMemIsToolsMemAvailable
+    XMemMapPhysicalPages
+    XMemMapPhysicalPagesScatter
+    XMemTransferMemory
+    XMemVirtualAlloc
+    PcXMemGetMetrics
+    PcXMemWritePhysicalPages

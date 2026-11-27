@@ -1,0 +1,13 @@
+[package]
+name = "chad_pc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "chad_pc"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shim_common = { path = "../shim_common" }
+zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }

@@ -1,0 +1,4 @@
+LIBRARY xg_pc
+EXPORTS
+    XGCreateTextureComputer
+    XGSuggestSwizzleMode

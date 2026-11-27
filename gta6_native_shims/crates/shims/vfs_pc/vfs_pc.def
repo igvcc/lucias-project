@@ -1,0 +1,42 @@
+LIBRARY vfs_pc
+EXPORTS
+    VfsMountDriveW
+    VfsUnmountAll
+    VfsTranslatePathW
+    VfsTranslatePathA
+    CreateDirectoryW = VfsCreateDirectoryW
+    CreateFileW = VfsCreateFileW
+    DeleteFileW = VfsDeleteFileW
+    FindFirstFileW = VfsFindFirstFileW
+    GetDiskFreeSpaceExW = VfsGetDiskFreeSpaceExW
+    GetFileAttributesA = VfsGetFileAttributesA
+    GetFileAttributesExW = VfsGetFileAttributesExW
+    GetFileAttributesW = VfsGetFileAttributesW
+    MoveFileExW = VfsMoveFileExW
+    RemoveDirectoryW = VfsRemoveDirectoryW
+    SetFileAttributesW = VfsSetFileAttributesW
+    FileTimeToLocalFileTime = kernel32.FileTimeToLocalFileTime
+    FindClose = kernel32.FindClose
+    FindNextFileW = kernel32.FindNextFileW
+    FlushFileBuffers = kernel32.FlushFileBuffers
+    GetFileSizeEx = kernel32.GetFileSizeEx
+    GetFileTime = kernel32.GetFileTime
+    LocalFileTimeToFileTime = kernel32.LocalFileTimeToFileTime
+    ReadFile = kernel32.ReadFile
+    SetEndOfFile = kernel32.SetEndOfFile
+    SetFilePointerEx = kernel32.SetFilePointerEx
+    SetFileTime = kernel32.SetFileTime
+    WriteFile = kernel32.WriteFile
+    FreeLibrary = kernel32.FreeLibrary
+    GetModuleFileNameA = kernel32.GetModuleFileNameA
+    GetModuleFileNameW = kernel32.GetModuleFileNameW
+    GetModuleHandleA = kernel32.GetModuleHandleA
+    GetModuleHandleW = kernel32.GetModuleHandleW
+    GetProcAddress = kernel32.GetProcAddress
+    LoadLibraryExA = VfsLoadLibraryExA
+    LoadLibraryExW = VfsLoadLibraryExW
+    LoadLibraryW = VfsLoadLibraryW
+    RegCloseKey = VfsRegCloseKey
+    RegOpenKeyW = VfsRegOpenKeyW
+    RegOpenKeyExW = VfsRegOpenKeyExW
+    RegQueryValueExW = VfsRegQueryValueExW

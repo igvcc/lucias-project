@@ -1,0 +1,9 @@
+[package]
+name = "gta6_native_renderer"
+version = "0.1.0"
+edition = "2021"
+description = "LUCIAS PROJECT — Static .text signature verifier, Native PC D3D12 Memory/Residency Bridge (RTX 3070 8GB | R9 5900X | 16GB DDR4), DXR 1.1 BVH translator, and XG surface mapper (Scarlett->PC)"
+
+[lib]
+name = "gta6_native_renderer"
+path = "src/lib.rs"

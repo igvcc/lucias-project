@@ -1,0 +1,34 @@
+# Build & stage outputs
+target/
+out/
+samples_out/
+logs/
+pc_cache/
+
+# Compiled binaries & debug symbols
+*.dll
+*.exe
+*.pdb
+*.lib
+*.exp
+*.obj
+*.o
+
+# Game assets, shaders, captures & logs
+*.rpf
+*.ttpf
+*.dxil
+*.dds
+*.dxilpack
+*.bin
+*.dat
+*.dmp
+*.log
+*.ppm
+*.png
+*.jpg
+
+# Secrets & OS files
+*.pem
+.DS_Store
+Thumbs.db

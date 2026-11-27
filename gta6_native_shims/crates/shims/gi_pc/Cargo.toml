@@ -1,0 +1,13 @@
+[package]
+name = "gi_pc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "gi_pc"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shim_common = { path = "../shim_common" }
+windows-sys.workspace = true

@@ -1,0 +1,873 @@
+#![allow(non_snake_case)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+use std::ffi::{CStr, c_char, c_void};
+use std::fs::File;
+use std::os::windows::fs::FileExt;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use shim_common::{
+    E_INVALIDARG, E_NOINTERFACE, E_POINTER, Guid, HRESULT, S_OK, VtableHeader, boot_trace,
+    boot_trace_hr, read_wide_str, translate_virtual_path_str,
+};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+/// Xbox Scarlett `IDStorageFactoryX` / `IDStorageFactoryX2` GUID.
+pub const IID_DSTORAGE_FACTORY_X: Guid = Guid::new(
+    0x6295_9D11,
+    0xD45F,
+    0x4884,
+    [0xA0, 0xA3, 0xF7, 0x86, 0x2E, 0xA2, 0x43, 0xAE],
+);
+
+/// Standard PC `IDStorageFactory` GUID.
+pub const IID_DSTORAGE_FACTORY_PC: Guid = Guid::new(
+    0x6924_EA0C,
+    0xC3CD,
+    0x4826,
+    [0xB1, 0x0A, 0xF6, 0x4F, 0x4E, 0xD9, 0x27, 0xC1],
+);
+
+const IID_IUNKNOWN: Guid = Guid::new(0x0000_0000, 0x0000, 0x0000, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+
+const E_PENDING: HRESULT = 0x8000_000A_u32 as i32;
+const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
+const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
+
+const OPT_ZLIB: u64 = 1;
+const OPT_BCPACK_MASK: u64 = 0xF << 1;
+const OPT_PAGE_DESTINATION: u64 = 1 << 21;
+const OPT_MEMORY_SOURCE: u64 = 1 << 22;
+const PAGE_64K: usize = 64 * 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QueueDesc {
+    pub source_type: u64,
+    pub capacity: u16,
+    pub priority: i8,
+    pub name: *const c_char,
+    pub flags: u64,
+}
+
+/// Exact Xbox Scarlett `DSTORAGE_REQUEST` (`0x48` bytes, matching `victory-hle/src/modules/dstorage.rs`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DStorageRequest {
+    pub options: u64,
+    /// Destination VA, or `*const usize` physical page array when `OPT_PAGE_DESTINATION` is set.
+    pub destination: *mut c_void,
+    /// With `OPT_PAGE_DESTINATION`, low 16 bits are byte offset into the first 64 KiB page.
+    pub page_offset: u64,
+    pub destination_size: u32,
+    /// `*const FileObject`, or memory buffer pointer when `OPT_MEMORY_SOURCE` is set.
+    pub source: *const c_void,
+    pub source_offset: u64,
+    pub source_size: u32,
+    pub intermediate_size: u32,
+    pub cancellation_tag: u64,
+    pub name: *const c_char,
+}
+
+const _: () = assert!(size_of::<DStorageRequest>() == 0x48);
+const _: () = assert!(std::mem::offset_of!(DStorageRequest, destination) == 0x08);
+const _: () = assert!(std::mem::offset_of!(DStorageRequest, source) == 0x20);
+
+#[repr(C)]
+struct FactoryObject {
+    vtable: *const *const c_void,
+}
+
+#[repr(C)]
+pub struct FileObject {
+    vtable: *const *const c_void,
+    refs: AtomicU32,
+    path: String,
+    file: Option<File>,
+}
+
+#[repr(C)]
+pub struct StatusArrayObject {
+    vtable: *const *const c_void,
+    refs: AtomicU32,
+    entries: Vec<AtomicI32>,
+}
+
+enum QueuedCommand {
+    Read(DStorageRequest),
+    Status {
+        status: usize, // *mut StatusArrayObject
+        index: u32,
+    },
+}
+
+#[repr(C)]
+pub struct QueueObject {
+    vtable: *const *const c_void,
+    refs: AtomicU32,
+    capacity: u16,
+    priority: i8,
+    submitted: AtomicU64,
+    has_ttdb_pending: AtomicBool,
+    pending: Mutex<Vec<QueuedCommand>>,
+    first_error: Mutex<Option<HRESULT>>,
+}
+
+extern "system" fn factory_missing<const SLOT: usize>(_this: *mut FactoryObject) -> HRESULT {
+    boot_trace(
+        "xcrd_pc",
+        "IDStorageFactoryX::stub",
+        &format!("slot={SLOT} (+{:#x})", SLOT * 8),
+    );
+    S_OK
+}
+
+extern "system" fn file_missing<const SLOT: usize>(_this: *mut FileObject) -> HRESULT {
+    boot_trace(
+        "xcrd_pc",
+        "IDStorageFileX::stub",
+        &format!("slot={SLOT} (+{:#x})", SLOT * 8),
+    );
+    S_OK
+}
+
+extern "system" fn queue_missing<const SLOT: usize>(_this: *mut QueueObject) -> HRESULT {
+    boot_trace(
+        "xcrd_pc",
+        "IDStorageQueueX::stub",
+        &format!("slot={SLOT} (+{:#x})", SLOT * 8),
+    );
+    S_OK
+}
+
+/// 16-slot Scarlett `IDStorageFactoryX2` vtable (slot 8 = `SetStagingBufferSize`, slot 10 = `CreateQueue2`).
+static FACTORY_VTABLE: VtableHeader<16> = VtableHeader([
+    factory_qi as *const c_void,                 // 0 (0x00) QueryInterface
+    factory_add_ref as *const c_void,            // 1 (0x08) AddRef
+    factory_release as *const c_void,            // 2 (0x10) Release
+    factory_create_queue as *const c_void,       // 3 (0x18) CreateQueue (legacy 2020)
+    factory_open_file as *const c_void,          // 4 (0x20) OpenFile
+    factory_create_status_array as *const c_void,// 5 (0x28) CreateStatusArray
+    factory_set_cpu_affinity as *const c_void,   // 6 (0x30) SetCpuAffinity
+    factory_set_debug_flags as *const c_void,    // 7 (0x38) SetDebugFlags
+    factory_set_staging_buffer_size as *const c_void, // 8 (0x40) SetStagingBufferSize
+    factory_missing::<9> as *const c_void,       // 9 (0x48)
+    factory_create_queue as *const c_void,       // 10 (0x50) CreateQueue (Scarlett X2)
+    factory_missing::<11> as *const c_void,      // 11 (0x58)
+    factory_missing::<12> as *const c_void,      // 12 (0x60)
+    factory_missing::<13> as *const c_void,      // 13 (0x68)
+    factory_missing::<14> as *const c_void,      // 14 (0x70)
+    factory_missing::<15> as *const c_void,      // 15 (0x78)
+]);
+
+static FACTORY_SINGLETON: FactoryObject = FactoryObject {
+    vtable: FACTORY_VTABLE.0.as_ptr(),
+};
+
+unsafe impl Sync for FactoryObject {}
+
+static FILE_VTABLE: VtableHeader<8> = VtableHeader([
+    generic_qi as *const c_void,
+    file_add_ref as *const c_void,
+    file_release as *const c_void,
+    file_close as *const c_void,
+    file_get_info as *const c_void,
+    file_missing::<5> as *const c_void,
+    file_missing::<6> as *const c_void,
+    file_missing::<7> as *const c_void,
+]);
+
+static STATUS_VTABLE: VtableHeader<5> = VtableHeader([
+    generic_qi as *const c_void,
+    status_add_ref as *const c_void,
+    status_release as *const c_void,
+    status_is_complete as *const c_void,   // 3 (0x18) IsComplete
+    status_get_hresult as *const c_void,   // 4 (0x20) GetHResult
+]);
+
+static QUEUE_VTABLE: VtableHeader<12> = VtableHeader([
+    generic_qi as *const c_void,
+    queue_add_ref as *const c_void,
+    queue_release as *const c_void,
+    queue_enqueue_request as *const c_void, // 3 (0x18) EnqueueRequest
+    queue_enqueue_status as *const c_void,  // 4 (0x20) EnqueueStatus
+    queue_enqueue_signal as *const c_void,  // 5 (0x28) EnqueueSignal
+    queue_submit as *const c_void,          // 6 (0x30) Submit
+    queue_cancel_tag as *const c_void,      // 7 (0x38) CancelRequestsWithTag
+    queue_close as *const c_void,           // 8 (0x40) Close
+    queue_missing::<9> as *const c_void,    // 9 (0x48) GetErrorEvent
+    queue_missing::<10> as *const c_void,   // 10 (0x50) RetrieveErrorRecord
+    queue_missing::<11> as *const c_void,   // 11 (0x58) Query
+]);
+
+type WritePhysFn = unsafe extern "system" fn(*const usize, usize, usize, *const u8, usize) -> i32;
+
+static WRITE_PHYS_FN: OnceLock<Option<usize>> = OnceLock::new();
+
+fn resolve_write_phys() -> Option<WritePhysFn> {
+    let addr = *WRITE_PHYS_FN.get_or_init(|| {
+        let wide: Vec<u16> = "xmem_pc.dll\0".encode_utf16().collect();
+        let h = unsafe { GetModuleHandleW(wide.as_ptr()) };
+        if h.is_null() {
+            return None;
+        }
+        unsafe { GetProcAddress(h, c"PcXMemWritePhysicalPages".as_ptr().cast()) }
+            .map(|f| f as usize)
+    });
+    addr.map(|a| unsafe { std::mem::transmute::<usize, WritePhysFn>(a) })
+}
+
+fn cstr_lossy(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+}
+
+extern "system" fn factory_qi(
+    this: *mut FactoryObject,
+    iid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let Some(g) = (unsafe { iid.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    if *g == IID_IUNKNOWN || *g == IID_DSTORAGE_FACTORY_X || *g == IID_DSTORAGE_FACTORY_PC {
+        unsafe { *out = this.cast() };
+        S_OK
+    } else {
+        unsafe { *out = std::ptr::null_mut() };
+        E_NOINTERFACE
+    }
+}
+
+extern "system" fn factory_add_ref(_: *mut FactoryObject) -> u32 {
+    1
+}
+
+extern "system" fn factory_release(_: *mut FactoryObject) -> u32 {
+    1
+}
+
+extern "system" fn generic_qi(
+    this: *mut c_void,
+    iid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    if unsafe { iid.as_ref() } == Some(&IID_IUNKNOWN) {
+        unsafe { *out = this };
+        S_OK
+    } else {
+        unsafe { *out = std::ptr::null_mut() };
+        E_NOINTERFACE
+    }
+}
+
+extern "system" fn factory_set_cpu_affinity(_: *mut FactoryObject, _mask: u64) -> HRESULT {
+    S_OK
+}
+
+extern "system" fn factory_set_debug_flags(_: *mut FactoryObject, _flags: u32) -> HRESULT {
+    S_OK
+}
+
+extern "system" fn factory_set_staging_buffer_size(_: *mut FactoryObject, bytes: u32) -> HRESULT {
+    boot_trace(
+        "xcrd_pc",
+        "IDStorageFactoryX::SetStagingBufferSize",
+        &format!("bytes={bytes:#x}"),
+    );
+    S_OK
+}
+
+extern "system" fn factory_open_file(
+    _: *mut FactoryObject,
+    path: *const u16,
+    _iid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let Some(raw_path) = (unsafe { read_wide_str(path) }) else {
+        return E_INVALIDARG;
+    };
+    let host_path = translate_virtual_path_str(&raw_path).unwrap_or_else(|| raw_path.clone());
+    match File::open(&host_path) {
+        Ok(file) => {
+            let obj = Box::new(FileObject {
+                vtable: FILE_VTABLE.0.as_ptr(),
+                refs: AtomicU32::new(1),
+                path: host_path.clone(),
+                file: Some(file),
+            });
+            let ptr = Box::into_raw(obj).cast();
+            unsafe { *out = ptr };
+            boot_trace_hr(
+                "xcrd_pc",
+                "IDStorageFactoryX::OpenFile",
+                S_OK,
+                &format!("raw={raw_path} host={host_path}"),
+            );
+            S_OK
+        }
+        Err(err) => {
+            unsafe { *out = std::ptr::null_mut() };
+            let hr = err
+                .raw_os_error()
+                .map_or(0x8007_0002_u32 as i32, |e| (0x8007_0000 | (e as u32 & 0xFFFF)) as i32);
+            boot_trace_hr(
+                "xcrd_pc",
+                "IDStorageFactoryX::OpenFile",
+                hr,
+                &format!("raw={raw_path} host={host_path} err={err}"),
+            );
+            hr
+        }
+    }
+}
+
+extern "system" fn factory_create_status_array(
+    _: *mut FactoryObject,
+    capacity: u32,
+    name: *const c_char,
+    _iid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let cap = capacity as usize;
+    let obj = Box::new(StatusArrayObject {
+        vtable: STATUS_VTABLE.0.as_ptr(),
+        refs: AtomicU32::new(1),
+        entries: (0..cap).map(|_| AtomicI32::new(S_OK)).collect(),
+    });
+    let ptr = Box::into_raw(obj).cast();
+    unsafe { *out = ptr };
+    boot_trace_hr(
+        "xcrd_pc",
+        "IDStorageFactoryX::CreateStatusArray",
+        S_OK,
+        &format!("cap={capacity} name={}", cstr_lossy(name)),
+    );
+    S_OK
+}
+
+extern "system" fn factory_create_queue(
+    _: *mut FactoryObject,
+    desc: *const QueueDesc,
+    _iid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let Some(d) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let obj = Box::new(QueueObject {
+        vtable: QUEUE_VTABLE.0.as_ptr(),
+        refs: AtomicU32::new(1),
+        capacity: d.capacity,
+        priority: d.priority,
+        submitted: AtomicU64::new(0),
+        has_ttdb_pending: AtomicBool::new(false),
+        pending: Mutex::new(Vec::new()),
+        first_error: Mutex::new(None),
+    });
+    let ptr = Box::into_raw(obj).cast();
+    unsafe { *out = ptr };
+    boot_trace_hr(
+        "xcrd_pc",
+        "IDStorageFactoryX::CreateQueue",
+        S_OK,
+        &format!(
+            "src={} cap={} prio={} flags={:#x} name={}",
+            d.source_type,
+            d.capacity,
+            d.priority,
+            d.flags,
+            cstr_lossy(d.name)
+        ),
+    );
+    S_OK
+}
+
+extern "system" fn file_add_ref(this: *mut FileObject) -> u32 {
+    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+extern "system" fn file_release(this: *mut FileObject) -> u32 {
+    let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        drop(unsafe { Box::from_raw(this) });
+    }
+    left
+}
+
+extern "system" fn file_close(this: *mut FileObject) {
+    if !this.is_null() {
+        unsafe { &mut *this }.file = None;
+    }
+}
+
+extern "system" fn file_get_info(this: *mut FileObject, info: *mut u64) -> HRESULT {
+    if this.is_null() || info.is_null() {
+        return E_INVALIDARG;
+    }
+    if let Some(f) = unsafe { &*this }.file.as_ref() {
+        if let Ok(meta) = f.metadata() {
+            unsafe { *info = meta.len() };
+            return S_OK;
+        }
+    }
+    0x8007_0006_u32 as i32
+}
+
+extern "system" fn status_add_ref(this: *mut StatusArrayObject) -> u32 {
+    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+extern "system" fn status_release(this: *mut StatusArrayObject) -> u32 {
+    let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        drop(unsafe { Box::from_raw(this) });
+    }
+    left
+}
+
+extern "system" fn status_is_complete(this: *mut StatusArrayObject, index: u32) -> i32 {
+    let arr = unsafe { &*this };
+    let idx = index as usize;
+    i32::from(idx < arr.entries.len() && arr.entries[idx].load(Ordering::Acquire) != E_PENDING)
+}
+
+extern "system" fn status_get_hresult(this: *mut StatusArrayObject, index: u32) -> HRESULT {
+    let arr = unsafe { &*this };
+    let idx = index as usize;
+    if idx < arr.entries.len() {
+        arr.entries[idx].load(Ordering::Acquire)
+    } else {
+        E_INVALIDARG
+    }
+}
+
+extern "system" fn queue_add_ref(this: *mut QueueObject) -> u32 {
+    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+extern "system" fn queue_release(this: *mut QueueObject) -> u32 {
+    let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        drop(unsafe { Box::from_raw(this) });
+    }
+    left
+}
+
+fn execute_request(r: &DStorageRequest) -> HRESULT {
+    if r.source.is_null() || r.destination.is_null() {
+        return E_INVALIDARG;
+    }
+    let src_len = r.source_size as usize;
+    let dst_len = r.destination_size as usize;
+    if dst_len == 0 {
+        return S_OK;
+    }
+
+    // 1. Read source bytes (file or memory).
+    let mut raw = vec![0u8; src_len];
+    if (r.options & OPT_MEMORY_SOURCE) != 0 {
+        if src_len > 0 {
+            let src_ptr = unsafe { r.source.cast::<u8>().add(r.source_offset as usize) };
+            unsafe { std::ptr::copy_nonoverlapping(src_ptr, raw.as_mut_ptr(), src_len) };
+        }
+    } else {
+        let file_obj = unsafe { &*r.source.cast::<FileObject>() };
+        let Some(file) = file_obj.file.as_ref() else {
+            return E_INVALIDARG;
+        };
+        let mut done = 0usize;
+        while done < src_len {
+            match file.seek_read(&mut raw[done..], r.source_offset + done as u64) {
+                Ok(0) => return END_OF_FILE,
+                Ok(n) => done += n,
+                Err(_) => return END_OF_FILE,
+            }
+        }
+    }
+
+    // 2. Decompress if requested (ZLIB supported via zlib-rs).
+    let payload: Vec<u8> = if (r.options & OPT_BCPACK_MASK) != 0 {
+        boot_trace(
+            "xcrd_pc",
+            "IDStorageQueueX::BCPACK_WARN",
+            &format!(
+                "options={:#x} src={} dst={}",
+                r.options, r.source_size, r.destination_size
+            ),
+        );
+        raw
+    } else if (r.options & OPT_ZLIB) != 0 {
+        let mut out = vec![0u8; dst_len];
+        let (res, rc) =
+            zlib_rs::decompress_slice(&mut out, &raw, zlib_rs::InflateConfig::default());
+        if rc != zlib_rs::ReturnCode::Ok {
+            return INVALID_DATA;
+        }
+        res.to_vec()
+    } else {
+        raw
+    };
+
+    let write_len = payload.len().min(dst_len);
+
+    // 3. Write destination (VA or physical pages via xmem_pc).
+    if (r.options & OPT_PAGE_DESTINATION) != 0 {
+        let byte_off = (r.page_offset & 0xFFFF) as usize;
+        let page_count = (byte_off + write_len).div_ceil(PAGE_64K);
+        let Some(write_phys) = resolve_write_phys() else {
+            boot_trace(
+                "xcrd_pc",
+                "IDStorageQueueX::PAGE_DEST_NO_XMEM",
+                &format!("pages={page_count} len={write_len}"),
+            );
+            return E_INVALIDARG;
+        };
+        let ok = unsafe {
+            write_phys(
+                r.destination.cast::<usize>(),
+                page_count,
+                byte_off,
+                payload.as_ptr(),
+                write_len,
+            )
+        };
+        if ok == 0 {
+            return E_INVALIDARG;
+        }
+    } else {
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination.cast::<u8>(), write_len);
+        }
+    }
+    S_OK
+}
+
+fn request_compression_label(options: u64) -> String {
+    if (options & OPT_BCPACK_MASK) != 0 {
+        format!("BCPACK({})", (options & OPT_BCPACK_MASK) >> 1)
+    } else if (options & OPT_ZLIB) != 0 {
+        String::from("ZLIB")
+    } else {
+        String::from("NONE")
+    }
+}
+
+fn request_source_label(r: &DStorageRequest) -> String {
+    if r.source.is_null() {
+        String::from("null")
+    } else if (r.options & OPT_MEMORY_SOURCE) != 0 {
+        format!("mem={:?}", r.source)
+    } else {
+        let f = unsafe { &*r.source.cast::<FileObject>() };
+        format!("file={:?}({})", r.source, f.path)
+    }
+}
+
+fn is_ttdb_request(r: &DStorageRequest) -> bool {
+    if r.source.is_null() || (r.options & OPT_MEMORY_SOURCE) != 0 {
+        return false;
+    }
+    let lower = unsafe { &*r.source.cast::<FileObject>() }.path.to_ascii_lowercase();
+    lower.contains("ttdb") || lower.contains(".ttpf")
+}
+
+extern "system" fn queue_enqueue_request(this: *mut QueueObject, req: *const DStorageRequest) {
+    if this.is_null() || req.is_null() {
+        return;
+    }
+    let q = unsafe { &*this };
+    let r = unsafe { *req };
+    let is_ttdb = is_ttdb_request(&r);
+    if is_ttdb {
+        q.has_ttdb_pending.store(true, Ordering::Release);
+    }
+    static ENQ_LOGS: AtomicU32 = AtomicU32::new(0);
+    static TTDB_ENQ_LOGS: AtomicU32 = AtomicU32::new(0);
+    let n = ENQ_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+    let should_log = n <= 32 || (is_ttdb && TTDB_ENQ_LOGS.fetch_add(1, Ordering::Relaxed) < 64);
+    if should_log {
+        boot_trace(
+            "xcrd_pc",
+            "IDStorageQueueX::EnqueueRequest",
+            &format!(
+                "#{n} q={this:?} src={} off={:#x} size={:#x} comp={} uncomp_size={:#x} dst={:?} page_off={:#x} opts={:#x} name={}",
+                request_source_label(&r),
+                r.source_offset,
+                r.source_size,
+                request_compression_label(r.options),
+                r.destination_size,
+                r.destination,
+                r.page_offset,
+                r.options,
+                cstr_lossy(r.name),
+            ),
+        );
+    }
+    q.pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(QueuedCommand::Read(r));
+}
+
+extern "system" fn queue_enqueue_status(
+    this: *mut QueueObject,
+    status: *mut StatusArrayObject,
+    index: u32,
+) {
+    if this.is_null() || status.is_null() {
+        return;
+    }
+    let q = unsafe { &*this };
+    let is_ttdb = q.has_ttdb_pending.load(Ordering::Acquire);
+    static ENQ_STATUS_LOGS: AtomicU32 = AtomicU32::new(0);
+    static TTDB_STATUS_LOGS: AtomicU32 = AtomicU32::new(0);
+    let n = ENQ_STATUS_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 32 || (is_ttdb && TTDB_STATUS_LOGS.fetch_add(1, Ordering::Relaxed) < 64) {
+        boot_trace(
+            "xcrd_pc",
+            "IDStorageQueueX::EnqueueStatus",
+            &format!("#{n} q={this:?} status={status:?} index={index} ttdb={is_ttdb}"),
+        );
+    }
+    let s = unsafe { &*status };
+    if (index as usize) < s.entries.len() {
+        s.entries[index as usize].store(E_PENDING, Ordering::Release);
+    }
+    status_add_ref(status);
+    q.pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(QueuedCommand::Status {
+            status: status as usize,
+            index,
+        });
+}
+
+extern "system" fn queue_enqueue_signal(_: *mut QueueObject, _fence: *mut c_void, _val: u64) {}
+
+extern "system" fn queue_submit(this: *mut QueueObject) {
+    if this.is_null() {
+        return;
+    }
+    let q = unsafe { &*this };
+    q.submitted.fetch_add(1, Ordering::Relaxed);
+    let has_ttdb = q.has_ttdb_pending.swap(false, Ordering::AcqRel);
+    let cmds = {
+        let mut p = q.pending.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *p)
+    };
+    static SUBMIT_LOGS: AtomicU32 = AtomicU32::new(0);
+    static TTDB_SUBMIT_LOGS: AtomicU32 = AtomicU32::new(0);
+    let submit_n = SUBMIT_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+    if submit_n <= 32 || (has_ttdb && TTDB_SUBMIT_LOGS.fetch_add(1, Ordering::Relaxed) < 64) {
+        boot_trace(
+            "xcrd_pc",
+            "IDStorageQueueX::Submit",
+            &format!("#{submit_n} q={this:?} cmds={} ttdb={has_ttdb}", cmds.len()),
+        );
+    }
+    static REQ_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
+    static TTDB_REQ_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
+    static STATUS_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
+    static TTDB_STATUS_DONE_LOGS: AtomicU32 = AtomicU32::new(0);
+    let mut err_slot = q.first_error.lock().unwrap_or_else(|e| e.into_inner());
+    for cmd in cmds {
+        match cmd {
+            QueuedCommand::Read(req) => {
+                let is_ttdb = is_ttdb_request(&req);
+                let hr = execute_request(&req);
+                let rn = REQ_DONE_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+                if rn <= 32
+                    || hr < 0
+                    || (is_ttdb && TTDB_REQ_DONE_LOGS.fetch_add(1, Ordering::Relaxed) < 64)
+                {
+                    boot_trace_hr(
+                        "xcrd_pc",
+                        "IDStorageQueueX::RequestComplete",
+                        hr,
+                        &format!(
+                            "#{rn} src={} off={:#x} size={:#x} comp={} uncomp_size={:#x} dst={:?}",
+                            request_source_label(&req),
+                            req.source_offset,
+                            req.source_size,
+                            request_compression_label(req.options),
+                            req.destination_size,
+                            req.destination,
+                        ),
+                    );
+                }
+                if hr < 0 && err_slot.is_none() {
+                    *err_slot = Some(hr);
+                }
+            }
+            QueuedCommand::Status { status, index } => {
+                let st_ptr = status as *mut StatusArrayObject;
+                let s = unsafe { &*st_ptr };
+                let hr = err_slot.take().unwrap_or(S_OK);
+                if (index as usize) < s.entries.len() {
+                    s.entries[index as usize].store(hr, Ordering::Release);
+                }
+                let sn = STATUS_DONE_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+                if sn <= 32
+                    || hr < 0
+                    || (has_ttdb && TTDB_STATUS_DONE_LOGS.fetch_add(1, Ordering::Relaxed) < 64)
+                {
+                    boot_trace_hr(
+                        "xcrd_pc",
+                        "IDStorageQueueX::StatusComplete",
+                        hr,
+                        &format!("#{sn} q={this:?} status={st_ptr:?} index={index} ttdb={has_ttdb}"),
+                    );
+                }
+                status_release(st_ptr);
+            }
+        }
+    }
+}
+
+extern "system" fn queue_cancel_tag(_: *mut QueueObject, _mask: u64, _val: u64) {}
+extern "system" fn queue_close(this: *mut QueueObject) {
+    queue_submit(this);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let Some(g) = (unsafe { iid.as_ref() }) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return E_INVALIDARG;
+    };
+    if *g == IID_DSTORAGE_FACTORY_X || *g == IID_DSTORAGE_FACTORY_PC || *g == IID_IUNKNOWN {
+        unsafe { *out = (&raw const FACTORY_SINGLETON).cast_mut().cast() };
+        boot_trace_hr(
+            "xcrd_pc",
+            "DStorageGetFactory",
+            S_OK,
+            &format!("iid={}", g.format_guid()),
+        );
+        S_OK
+    } else {
+        unsafe { *out = std::ptr::null_mut() };
+        boot_trace_hr(
+            "xcrd_pc",
+            "DStorageGetFactory",
+            E_NOINTERFACE,
+            &format!("iid={}", g.format_guid()),
+        );
+        E_NOINTERFACE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dstorage_factory_opens_file_and_reads_via_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let test_file = dir.path().join("chunk.bin");
+        std::fs::write(&test_file, b"LUCIAS_DSTORAGE").unwrap();
+
+        let mut factory_ptr: *mut c_void = std::ptr::null_mut();
+        assert_eq!(DStorageGetFactory(&IID_DSTORAGE_FACTORY_X, &mut factory_ptr), S_OK);
+        assert!(!factory_ptr.is_null());
+
+        // Verify Scarlett vtable slots 8 (SetStagingBufferSize @ +0x40) and 10 (CreateQueue @ +0x50).
+        let vtbl = unsafe { *factory_ptr.cast::<*const *const c_void>() };
+        type SetStagingFn = unsafe extern "system" fn(*mut c_void, u32) -> HRESULT;
+        type CreateQueueFn =
+            unsafe extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, *mut *mut c_void) -> HRESULT;
+        let set_staging: SetStagingFn = unsafe { std::mem::transmute(*vtbl.add(8)) };
+        let create_q_slot10: CreateQueueFn = unsafe { std::mem::transmute(*vtbl.add(10)) };
+        assert_eq!(unsafe { set_staging(factory_ptr, 32 * 1024 * 1024) }, S_OK);
+
+        let wide_path: Vec<u16> = test_file
+            .to_string_lossy()
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut file_ptr: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            factory_open_file(
+                factory_ptr.cast(),
+                wide_path.as_ptr(),
+                &IID_IUNKNOWN,
+                &mut file_ptr
+            ),
+            S_OK
+        );
+
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 32,
+            priority: 0,
+            name: std::ptr::null(),
+            flags: 1,
+        };
+        let mut queue_ptr: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { create_q_slot10(factory_ptr, &desc, &IID_IUNKNOWN, &mut queue_ptr) },
+            S_OK
+        );
+
+        let mut status_ptr: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            factory_create_status_array(
+                factory_ptr.cast(),
+                4,
+                std::ptr::null(),
+                &IID_IUNKNOWN,
+                &mut status_ptr
+            ),
+            S_OK
+        );
+
+        let mut out_buf = [0u8; 15];
+        let req = DStorageRequest {
+            options: 0,
+            destination: out_buf.as_mut_ptr().cast(),
+            page_offset: 0,
+            destination_size: 15,
+            source: file_ptr.cast(),
+            source_offset: 0,
+            source_size: 15,
+            intermediate_size: 0,
+            cancellation_tag: 0,
+            name: std::ptr::null(),
+        };
+        queue_enqueue_request(queue_ptr.cast(), &req);
+        queue_enqueue_status(queue_ptr.cast(), status_ptr.cast(), 0);
+        // Deferred execution: still pending before Submit!
+        assert_eq!(status_is_complete(status_ptr.cast(), 0), 0);
+        queue_submit(queue_ptr.cast());
+
+        assert_eq!(status_is_complete(status_ptr.cast(), 0), 1);
+        assert_eq!(status_get_hresult(status_ptr.cast(), 0), S_OK);
+        assert_eq!(&out_buf, b"LUCIAS_DSTORAGE");
+
+        status_release(status_ptr.cast());
+        queue_release(queue_ptr.cast());
+        file_release(file_ptr.cast());
+    }
+}

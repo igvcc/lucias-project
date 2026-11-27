@@ -1,0 +1,16 @@
+[package]
+name = "vfs_pc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "vfs_pc"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shim_common = { path = "../shim_common" }
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

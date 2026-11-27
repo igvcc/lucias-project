@@ -1,0 +1,3 @@
+LIBRARY gi_pc
+EXPORTS
+    GameInputCreate @1 NONAME

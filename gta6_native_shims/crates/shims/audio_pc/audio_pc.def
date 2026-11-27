@@ -1,0 +1,16 @@
+LIBRARY audio_pc
+EXPORTS
+    XApuConnect
+    XApuDequeueResult
+    XApuDisconnect
+    XApuEnqueueCommand
+    XApuGetResultCount
+    AcpHalAllocateShapeContexts
+    AcpHalCreate
+    AcpHalReleaseShapeContexts
+    ApuAlloc
+    ApuCreateHeap
+    ApuFree
+    ApuIsVirtualAddressValid
+    ApuMapApuAddress
+    ApuMapVirtualAddress

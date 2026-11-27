@@ -1,0 +1,22 @@
+[package]
+name = "gta6_native_tools"
+version = "0.1.0"
+edition = "2024"
+description = "LUCIAS PROJECT — Offline RPF9, TTPF (RDS5/ETPF/BCPack/Zstd), SGD5/ACCC shader, and audio/video inspection & PC conversion tooling."
+
+[dependencies]
+victory-formats = { path = "../cgbj-fork/crates/victory-formats" }
+victory-shader = { path = "../cgbj-fork/crates/victory-shader" }
+victory-game = { path = "../cgbj-fork/crates/victory-game" }
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+clap = { version = "4.6.9", features = ["derive"] }
+memchr = "2.8.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
+zstd = "0.13.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"
