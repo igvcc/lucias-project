@@ -2929,6 +2929,10 @@ extern "system" fn dev_copy_descriptors(
     heap_ty: u32,
 ) {
     let real = unsafe { &*this }.real_device;
+    static COPY_LOGS: AtomicU32 = AtomicU32::new(0);
+    if COPY_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+        boot_trace("dx12xs_pc", "DeviceX::CopyDescriptors", &format!("n_dst={n_dst} n_src={n_src} ty={heap_ty}"));
+    }
     let mut dst_vec: Vec<u64> = Vec::new();
     if !dst_starts.is_null() {
         for i in 0..(n_dst as usize) {
@@ -2987,8 +2991,8 @@ extern "system" fn dev_copy_descriptors_simple(
         return;
     };
     static COPY_SIMPLE_LOGS: AtomicU32 = AtomicU32::new(0);
-    if COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
-        boot_trace("dx12xs_pc", "DeviceX::CopyDescriptorsSimple", &format!("n={n} ty={heap_ty} dst={dst:#x}->{pc_dst:#x} src={src:#x}->{pc_src:#x}"));
+    if heap_ty == 0 && COPY_SIMPLE_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+        boot_trace("dx12xs_pc", "DeviceX::CopyDescriptorsSimple(ty0)", &format!("n={n} ty={heap_ty} dst={dst:#x}->{pc_dst:#x} src={src:#x}->{pc_src:#x}"));
     }
     let real = unsafe { &*this }.real_device;
     type FnTy = unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32);

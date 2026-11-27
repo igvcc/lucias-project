@@ -1155,6 +1155,7 @@ extern "system" fn xuser_token_async(
     _b: *const c_void,
     block: *mut XAsyncBlock,
 ) -> HRESULT {
+    boot_trace("xgameruntime", "XUser::GetTokenAndSignatureAsync", &format!("opts={_opts:#x} block={block:?}"));
     finish_async_with(block, FAILED_TO_GET_TOKEN, Vec::new())
 }
 extern "system" fn xuser_token_size(_: This, block: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
