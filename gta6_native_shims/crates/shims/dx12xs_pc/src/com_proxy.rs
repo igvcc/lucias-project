@@ -1077,15 +1077,17 @@ fn alloc_or_reuse_uma_cbv(
         static S13_96B_LOGS: AtomicU32 = AtomicU32::new(0);
         let n96 = S13_96B_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
         if n96 <= 8 {
-            let mut w = [0u32; 8];
+            let mut w = [0u32; 16];
             for (i, out) in w.iter_mut().enumerate() {
                 *out = unsafe { pc_ptr.cast::<u32>().add(i).read_unaligned() };
             }
             boot_trace(
                 "dx12xs_pc",
                 "UmaCbvPool::s13_96b",
-                &format!("#{n96} xb={cpu_va:#x}->pc={pc_va:#x} w=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
+                &format!(
+                    "#{n96} xb={cpu_va:#x}->pc={pc_va:#x} w0..7=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] w8..15=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                    w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]
                 ),
             );
         }
@@ -2447,6 +2449,52 @@ extern "system" fn dev_create_pipeline_state_stream(
         size_in_bytes: pc_stream.len(),
         stream: pc_stream.as_ptr(),
     };
+    if primary_hash == 0xcc7a1fd71cd7f6b2 {
+        let mut blend_info = String::new();
+        let mut at_b = 0usize;
+        while at_b + 8 <= pc_stream.len() {
+            let k = u32::from_le_bytes(pc_stream[at_b..at_b + 4].try_into().unwrap());
+            let Some((sz_b, _)) = xbox_stream_subobject_info(k) else { break; };
+            if at_b + sz_b > pc_stream.len() { break; }
+            if k == 8 && sz_b >= 52 {
+                let d0 = u32::from_le_bytes(pc_stream[at_b + 16..at_b + 20].try_into().unwrap());
+                let src = u32::from_le_bytes(pc_stream[at_b + 24..at_b + 28].try_into().unwrap());
+                let dst = u32::from_le_bytes(pc_stream[at_b + 28..at_b + 32].try_into().unwrap());
+                let op = u32::from_le_bytes(pc_stream[at_b + 32..at_b + 36].try_into().unwrap());
+                let wmask = u32::from_le_bytes(pc_stream[at_b + 52..at_b + 56].try_into().unwrap());
+                blend_info = format!("blend0=[en={d0},src={src},dst={dst},op={op},wmask={wmask:#x}]");
+            }
+            at_b += sz_b;
+        }
+        let il_info = if let Some(il_off) = input_layout_off {
+            let ptr = usize::from_le_bytes(pc_stream[il_off..il_off + 8].try_into().unwrap()) as *const u8;
+            if !ptr.is_null() && input_elems_logged <= 4 {
+                (0..input_elems_logged as usize)
+                    .map(|i| unsafe {
+                        let e = ptr.add(i * 32);
+                        let sem_idx = e.add(8).cast::<u32>().read_unaligned();
+                        let fmt = e.add(12).cast::<u32>().read_unaligned();
+                        let slot = e.add(16).cast::<u32>().read_unaligned();
+                        let off = e.add(20).cast::<u32>().read_unaligned();
+                        format!("({sem_idx},fmt={fmt},slot={slot},off={off})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        boot_trace(
+            "dx12xs_pc",
+            "DeviceX::CreatePipelineState(s13_5_VS)",
+            &format!(
+                "tags={tags:?} il_cnt={input_elems_logged}[{il_info}] {blend_info} nrt={num_rt_logged} rtv0={} dsv={dsv_fmt_logged} depth_en={depth_en_logged} sample_cnt={sample_cnt_logged}",
+                rtv_fmts_logged[0]
+            ),
+        );
+    }
     let mut used_fallback = false;
     let orig_rs = root_sig_patch_off.map_or(std::ptr::null_mut(), |rs_off| unsafe {
         pc_stream
@@ -5546,6 +5594,11 @@ fn upload_shadow_to_real(r: &ResourceX, sub: u32) {
     static UPLOAD_LOGS: AtomicU32 = AtomicU32::new(0);
     let un = UPLOAD_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
     if un <= 16 {
+        let sample_len = shadow_bytes.min(65536);
+        let nz_bytes = unsafe { std::slice::from_raw_parts(shadow_ptr, sample_len) }
+            .iter()
+            .filter(|&&b| b != 0)
+            .count();
         let fp_info = footprint_opt.map(|f| {
             format!(
                 "fp=(off={} fmt={} {}x{}x{} pitch={})",
@@ -5556,7 +5609,7 @@ fn upload_shadow_to_real(r: &ResourceX, sub: u32) {
             "dx12xs_pc",
             "ResourceX::Unmap(shadow-upload)",
             &format!(
-                "#{un} real={:?} sub={sub} dim={} w={} h={} arr={} mips={} fmt={} hr_ar={hr_ar:#x} hr_lr={hr_lr:#x} hr_cl={hr_cl:#x} {fp_info}",
+                "#{un} real={:?} sub={sub} dim={} w={} h={} arr={} mips={} fmt={} nz={nz_bytes}/{sample_len} hr_ar={hr_ar:#x} hr_lr={hr_lr:#x} hr_cl={hr_cl:#x} {fp_info}",
                 r.real_resource, r.desc.dimension, r.desc.width, r.desc.height, r.desc.depth_or_array, r.desc.mip_levels, r.desc.format
             ),
         );
